@@ -1,0 +1,886 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>BuzzCut - Your Bus Guide</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    :root {
+      --red: #e53935;
+      --skyblue: #7ecbff;
+      --text: #111;
+      --green: #2ecc40;
+      --yellow: #ffdc00;
+      --crowd-red: #e53935;
+      --white: #fff;
+    }
+    body {
+      min-height: 100vh;
+      background: var(--skyblue);
+      font-family: Calibri, 'Trebuchet MS', 'Segoe UI', 'Arial', sans-serif;
+      color: var(--text);
+      margin: 0;
+      letter-spacing: 0.01em;
+      overflow-x: hidden;
+      transition: background 0.4s;
+    }
+    .buzzcut-title {
+      font-family: Calibri, 'Trebuchet MS', 'Segoe UI', 'Arial', sans-serif;
+      font-weight: bold;
+      font-size: 3.5em;
+      text-align: center;
+      color: var(--text);
+      margin-top: 1.2em;
+      margin-bottom: 0.1em;
+      letter-spacing: 2px;
+      display: flex;
+      justify-content: center;
+      user-select: none;
+      gap: 0.04em;
+    }
+    .buzzcut-letter {
+      display: inline-block;
+      will-change: transform;
+    }
+    .subtitle {
+      text-align:center;
+      font-size:1.5em;
+      font-family: Calibri, 'Trebuchet MS', 'Segoe UI', 'Arial', sans-serif;
+      font-weight: 700;
+      color: #222b;
+      margin-bottom:1.5em;
+      letter-spacing:2px;
+    }
+    .instructions {
+      text-align: center;
+      font-size: 1.14em;
+      color: #1c1c1cbb;
+      background: #fff;
+      max-width: 420px;
+      margin: 0 auto 1.5em auto;
+      border-radius: 14px;
+      padding: 1em 1.2em;
+      box-shadow: 0 2px 8px #0001;
+    }
+    .tab-bar {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      margin-top: 1.5em;
+      margin-bottom: 1.5em;
+      gap: 0;
+      background: #fff3;
+      border-radius: 14px;
+      overflow: hidden;
+      box-shadow: 0 2px 8px #e5393530;
+      width: 100%;
+      max-width: 430px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    .tab-btn {
+      flex: 1;
+      padding: 1em 0;
+      font-family: Calibri, 'Trebuchet MS', 'Segoe UI', 'Arial', sans-serif;
+      font-size: 1.15em;
+      font-weight: bold;
+      background: none;
+      color: var(--text);
+      border: none;
+      outline: none;
+      cursor: pointer;
+      transition: background .18s, color .18s;
+      letter-spacing: 1.1px;
+      border-bottom: 4px solid transparent;
+      text-align: center;
+    }
+    .tab-btn.active {
+      background: #fff8;
+      color: var(--red);
+      border-bottom: 4px solid var(--red);
+      z-index: 1;
+    }
+    .container {
+      max-width: 1440px;
+      margin: 0 auto;
+      background: #fff7;
+      border-radius: 18px;
+      padding: 2em 2.2em 2.2em 2.2em;
+      box-shadow: 0 0 18px #0001;
+      margin-top: 1.5em;
+      margin-bottom: 2em;
+      position: relative;
+      backdrop-filter: blur(2px);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    .input-row {
+      display: flex;
+      gap: 1em;
+      margin-bottom: 1.5em;
+      width: 100%;
+      max-width: 800px;
+      justify-content: center;
+    }
+    .location-bar {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      font-size: 1.1em;
+      color: var(--text);
+      margin-bottom: 0.2em;
+      min-width: 100px;
+      max-width: 430px;
+    }
+    .location-label {
+      font-weight: 700;
+      font-size: 1.09em;
+      margin-bottom: 8px;
+      color: var(--text);
+      letter-spacing: .5px;
+    }
+    select {
+      width: 100%;
+      margin-top: 0.2em;
+      padding: 0.7em 1.2em;
+      border-radius: 13px;
+      border: none;
+      background: #f5fbff;
+      color: var(--text);
+      font-size: 1.03em;
+      font-family: Calibri, 'Trebuchet MS', 'Segoe UI', 'Arial', sans-serif;
+      box-shadow: 0 3px 12px #e539352a;
+      outline: none;
+      font-weight: 700;
+      transition: border .18s, box-shadow .18s;
+      border: 2.5px solid transparent;
+      min-width: 80px;
+      max-width: 430px;
+      margin-bottom: 0.5em;
+    }
+    select:focus {
+      border: 2.5px solid var(--red);
+      box-shadow: 0 0 0 4px #e5393533;
+      background: #fff;
+    }
+    button, .alt-btn {
+      padding: 0.78em 2em;
+      background: var(--red);
+      color: #fff;
+      border: none;
+      border-radius: 11px;
+      font-size: 1.13em;
+      font-family: Calibri, 'Trebuchet MS', 'Segoe UI', 'Arial', sans-serif;
+      font-weight: bold;
+      cursor: pointer;
+      margin: 1em 0 1.4em 0;
+      box-shadow: 0 2px 8px #e5393530;
+      transition: background .18s;
+      letter-spacing: .7px;
+      outline: none;
+      display: inline-block;
+    }
+    button:hover, .alt-btn:hover {
+      background: #b71c1c;
+    }
+    #busMapPage {
+      display: none;
+      width: 100vw;
+      min-height: 100vh;
+      background: var(--skyblue);
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-start;
+    }
+    .map-header {
+      width: 100vw;
+      padding: 1em;
+      text-align: center;
+      font-size: 1.7em;
+      font-weight: bold;
+      background: #fff8;
+      color: var(--text);
+      letter-spacing: 2px;
+      box-shadow: 0 2px 8px #e5393530;
+    }
+    #busMap {
+      width: 90vw;
+      height: 60vh;
+      max-width: 850px;
+      margin: 2em auto 1.2em auto;
+      border-radius: 18px;
+      background: #e0f7fa;
+      box-shadow: 0 4px 18px #e5393530;
+    }
+    .back-btn {
+      position: absolute;
+      left: 2vw;
+      top: 2vw;
+      background: #fff2;
+      color: var(--text);
+      border: none;
+      border-radius: 8px;
+      font-size: 1.13em;
+      padding: 0.5em 1.3em;
+      cursor: pointer;
+      font-family: Calibri, 'Trebuchet MS', 'Segoe UI', 'Arial', sans-serif;
+      font-weight: bold;
+      box-shadow: 0 2px 8px #e5393530;
+      outline: none;
+      transition:background .18s;
+      z-index: 10;
+    }
+    .back-btn:hover { background: var(--red); color: #fff;}
+    .bus-list-min {
+      margin: 1.2em auto 2em auto;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1em;
+      justify-content: center;
+      width: 90vw;
+      max-width: 850px;
+      min-width: 260px;
+      background: #fff7;
+      border-radius: 0 0 18px 18px;
+      box-shadow: 0 2px 8px #e5393530;
+      padding: 1.3em 0.7em;
+      transition: width 0.3s;
+    }
+    .bus-card {
+      background:#f4faff;
+      margin:0.5em 0;
+      padding:1em 1.7em;
+      border-radius:10px;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      cursor:pointer;
+      transition: box-shadow .2s, border .2s;
+      border: 2px solid transparent;
+      font-size: 1.09em;
+      min-width: 180px;
+      max-width: 250px;
+      flex: 1 1 180px;
+      color:var(--text);
+    }
+    .bus-card.selected { border:2px solid var(--red); box-shadow:0 0 12px #fff2; }
+    .bus-info { font-size:1.14em; }
+    .crowd { padding:0.17em 0.7em; border-radius:5px; font-weight:bold; text-transform:capitalize; font-size:1em;}
+    .crowd.free { background:var(--green); color:#fff; }
+    .crowd.moderate { background:var(--yellow); color:#333; }
+    .crowd.full { background:var(--crowd-red); color:#fff; }
+    /* Metro Info Styling */
+    .metro-section {
+      margin: 1.6em 0 1.6em 0;
+      background: #f4faff;
+      border-radius: 14px;
+      padding: 1.1em 1em 1.1em 1em;
+      box-shadow: 0 2px 8px #e5393530;
+      color: var(--text);
+    }
+    .metro-title {
+      font-size: 1.35em;
+      font-weight: bold;
+      margin-bottom: .8em;
+      letter-spacing:1px;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-family: Calibri, 'Trebuchet MS', 'Segoe UI', 'Arial', sans-serif;
+    }
+    .metro-detail {
+      color: var(--text);
+      font-size: 1.08em;
+      padding-left: 0.2em;
+    }
+    .metro-row {
+      margin-bottom: 0.5em;
+      color: var(--text);
+    }
+    .metro-stations-list {
+      margin: 0.5em 0 0.7em 0;
+      padding: 0;
+      color: #098;
+      font-size: 0.98em;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5em 1.2em;
+      list-style-type: disc;
+      padding-left: 1.4em;
+    }
+    .metro-section.info-note {
+      background: #d9f5ff;
+      border-left: 6px solid #ffd600;
+      font-size: 1em;
+      padding: 1em 1.5em;
+      color: #444;
+      margin-top: 2.5em;
+      margin-bottom: 0.5em;
+    }
+    .status-dot {
+      width: 13px; height: 13px; border-radius:50%; display:inline-block; margin-right:7px; vertical-align:middle;
+    }
+    .blue-dot { background: #1565c0; }
+    .green-dot { background: #43a047; }
+    .sub-dot { background: #e53935; }
+    /* --- Bus AI/Popup --- */
+    .bus-ai-popup {
+      position: fixed;
+      right: -370px;
+      top: 20vh;
+      z-index: 9999;
+      width: 340px;
+      max-width: 90vw;
+      background: #1C768F; /* Peacock blue */
+      color: var(--text);
+      border-radius: 14px 0 0 14px;
+      box-shadow: -2px 6px 24px #0007;
+      padding: 0 1.1em 1.3em 1.1em;
+      font-family: Calibri, 'Trebuchet MS', 'Segoe UI', 'Arial', sans-serif;
+      transition: right 0.35s cubic-bezier(.7,.08,.42,1.07);
+      pointer-events: none;
+      opacity: 0;
+    }
+    .bus-ai-popup.active {
+      right: 0;
+      pointer-events: all;
+      opacity: 1;
+    }
+    .bus-ai-header {
+      font-family: Calibri, 'Trebuchet MS', 'Segoe UI', 'Arial', sans-serif;
+      font-size: 1.55em;
+      font-weight: bold;
+      letter-spacing: 2.2px;
+      color: var(--text);
+      margin: 1.1em 0 0.8em 0;
+      text-align: left;
+    }
+    .bus-ai-content {
+      font-size: 1.11em;
+      color: var(--text);
+      margin-bottom: 1.1em;
+    }
+    .bus-ai-close {
+      position: absolute;
+      top: 0;
+      right: 0;
+      margin: 8px;
+      background: none;
+      border: none;
+      color: var(--text);
+      font-size: 2em;
+      cursor: pointer;
+      font-weight: bold;
+      outline: none;
+      opacity: 0.7;
+      transition: opacity .13s;
+      z-index: 2;
+    }
+    .bus-ai-close:hover { opacity: 1; background: #e5393550; border-radius: 50%; color: #fff;}
+    .bus-ai-pred-crowd {
+      display: flex;
+      align-items: center;
+      gap: 0.8em;
+      margin: 0.7em 0;
+      font-size: 1.09em;
+    }
+    .bus-ai-crowd-ind {
+      display: inline-block;
+      min-width: 1.8em;
+      padding: 0.19em 0.9em;
+      border-radius: 7px;
+      font-weight: bold;
+      font-size: 1em;
+      text-transform: capitalize;
+      color: #fff;
+      margin-right: 0.6em;
+      letter-spacing: 1px;
+    }
+    .bus-ai-crowd-ind.free { background: #2ecc40; }
+    .bus-ai-crowd-ind.moderate { background: #ffdc00; color: #333; }
+    .bus-ai-crowd-ind.full { background: #e53935; }
+    .bus-ai-comfort-good {
+      color: #098;
+      font-weight: bold;
+      margin-left:0.3em;
+    }
+    .bus-ai-comfort-bad {
+      color: #e53935;
+      font-weight: bold;
+      margin-left:0.3em;
+    }
+    .freq-btn-inside {
+      margin-bottom: 1em;
+      background: var(--skyblue);
+      color: var(--text);
+      font-weight: bold;
+      font-size: 1.13em;
+      border: none;
+      border-radius: 13px;
+      padding: 0.56em 1.2em;
+      box-shadow: 0 2px 14px #0002;
+      cursor: pointer;
+      letter-spacing: .5px;
+      opacity: 0.92;
+      transition: background .18s, color .18s;
+      display: block;
+      margin-left: auto;
+      margin-right: auto;
+      font-family: Calibri, 'Trebuchet MS', 'Segoe UI', 'Arial', sans-serif;
+    }
+    .freq-btn-inside:hover {
+      background: #e53935;
+      color: #fff;
+    }
+    .freq-popup-content-inside {
+      font-size: 1.1em;
+      color: var(--text);
+      line-height: 1.7em;
+      background: #e0f7fa;
+      border-radius: 12px;
+      padding: 1em;
+      margin-bottom: 1em;
+      margin-top: -.4em;
+      box-shadow: 0 3px 12px #0005;
+      display: block;
+      animation: slideInFreq .33s;
+      font-family: Calibri, 'Trebuchet MS', 'Segoe UI', 'Arial', sans-serif;
+    }
+    @keyframes slideInFreq {
+      from { opacity: 0; transform: translateY(16px);}
+      to { opacity: 1; transform: translateY(0);}
+    }
+    @media (max-width:700px) {
+      .container { padding: 1.1em 0.5em 1em 0.5em;}
+      .tab-bar { max-width: 99vw; }
+      .tab-btn { font-size: 1em; }
+      #busMap { width: 99vw; }
+      .bus-list-min { width:99vw; max-width:99vw; }
+      .metro-section { padding: 0.7em 0.2em 0.7em 0.2em; }
+      .metro-title { font-size:1.08em; }
+      .metro-detail, .metro-row { font-size:0.97em; }
+      .metro-stations-list { font-size:0.93em; }
+      .bus-ai-popup {
+        right: -99vw;
+        width: 99vw;
+        left: unset;
+        top: unset;
+        bottom: 0;
+        border-radius: 18px 18px 0 0;
+        padding: 0 1.1em 2.3em 1.1em;
+        transition: right 0.35s cubic-bezier(.7,.08,.42,1.07), bottom 0.35s cubic-bezier(.7,.08,.42,1.07);
+      }
+      .bus-ai-popup.active { right: 0; bottom:0; }
+      .bus-ai-header { text-align:center; }
+      .bus-ai-close { right: 0; top: 0; margin: 8px; }
+    }
+  </style>
+</head>
+<body>
+  <div id="mainPage">
+    <div class="buzzcut-title" id="buzzcut-title"></div>
+    <div class="subtitle">Your Bus Guide</div>
+    <div class="instructions">
+      Select your Pickup and Destination, then click <b>Show Buses</b>.<br>
+      Or try the <b>Alternate Ways</b> tab for Metro and Suburban timings.
+    </div>
+    <div class="tab-bar">
+      <button class="tab-btn active" id="showBusesTab" onclick="switchTab('buses')">Show Buses</button>
+      <button class="tab-btn" id="alternateTab" onclick="switchTab('alternate')">Alternate Ways</button>
+    </div>
+    <div class="container" id="busFormContainer">
+      <form id="routeForm">
+        <div class="input-row">
+          <div class="location-bar">
+            <span class="location-label">Pickup</span>
+            <select id="pickup" required>
+              <option value="">Select...</option>
+              <option value="Chennai Central">Chennai Central</option>
+              <option value="Egmore">Egmore</option>
+              <option value="Guindy">Guindy</option>
+              <option value="Koyambedu">Koyambedu</option>
+              <option value="T. Nagar">T. Nagar</option>
+              <option value="Velachery">Velachery</option>
+            </select>
+          </div>
+          <div class="location-bar">
+            <span class="location-label">Destination</span>
+            <select id="destination" required>
+              <option value="">Select...</option>
+              <option value="Chennai Central">Chennai Central</option>
+              <option value="Egmore">Egmore</option>
+              <option value="Guindy">Guindy</option>
+              <option value="Koyambedu">Koyambedu</option>
+              <option value="T. Nagar">T. Nagar</option>
+              <option value="Velachery">Velachery</option>
+            </select>
+          </div>
+        </div>
+        <button type="submit">Show Buses</button>
+      </form>
+    </div>
+    <div class="container" id="altWaysContainer" style="display: none;">
+      <div class="alt-h1">BuzzCut</div>
+      <div class="alt-subtitle" id="altSubtitle">Metro & Suburban Train Timings for Your Pickup</div>
+      <div class="metro-section" id="blueLineSection">
+        <h2 class="metro-title"><span class="status-dot blue-dot"></span>Chennai Metro Blue Line</h2>
+        <div class="metro-detail" id="blueLineDetail"></div>
+      </div>
+      <div class="metro-section" id="greenLineSection">
+        <h2 class="metro-title"><span class="status-dot green-dot"></span>Chennai Metro Green Line</h2>
+        <div class="metro-detail" id="greenLineDetail"></div>
+      </div>
+      <div class="metro-section" id="suburbanSection">
+        <h2 class="metro-title"><span class="status-dot sub-dot"></span>Chennai Suburban Trains</h2>
+        <div class="metro-detail" id="suburbanDetail"></div>
+      </div>
+      <div class="metro-section info-note">
+        <span style="color:#444;">
+        <b>Note:</b> For the latest and most accurate timings, always check with station staff.<br>
+        Metro and suburban trains are frequent, clean, and air-conditioned—an excellent alternative to buses in Chennai!
+        </span>
+      </div>
+    </div>
+  </div>
+  <div id="busMapPage" style="display:none; position:relative; flex-direction:column; align-items:center;">
+    <button class="back-btn" onclick="goBackToMain()">← Back</button>
+    <div class="map-header">Nearby Buses</div>
+    <div id="busMap"></div>
+    <div class="bus-list-min" id="busListMin"></div>
+    <!-- Combined BUS AI and Frequency Popup -->
+    <div id="busAIPopup" class="bus-ai-popup">
+      <div class="bus-ai-header">BUS AI</div>
+      <div class="bus-ai-content" id="busAIContent"></div>
+      <button class="freq-btn-inside" id="freqBtnInside" onclick="toggleFreqContent()">Show Frequency</button>
+      <div class="freq-popup-content-inside" id="freqPopupContentInside" style="display:none;"></div>
+      <button class="bus-ai-close" onclick="closeBusAIPopup()">×</button>
+    </div>
+  </div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    // BuzzCut sway effect
+    const swayBuzzcut = () => {
+      const el = document.getElementById('buzzcut-title');
+      if (!el) return;
+      const text = 'BuzzCut';
+      if(!el.dataset.swayed){
+        el.innerHTML = '';
+        for (let i = 0; i < text.length; ++i) {
+          const span = document.createElement('span');
+          span.className = 'buzzcut-letter';
+          span.textContent = text[i];
+          el.appendChild(span);
+        }
+        el.dataset.swayed = "1";
+      }
+      const letters = el.querySelectorAll('.buzzcut-letter');
+      let sway = () => {
+        const now = Date.now();
+        for (let i = 0; i < letters.length; ++i) {
+          const angle = Math.sin(now/650 + i*0.5) * 0.17;
+          const x = Math.sin(now/900 + i*0.8) * 0.1;
+          const y = Math.sin(now/570 + i*0.7) * 0.1;
+          letters[i].style.transform = `rotate(${angle}deg) translate(${x}px, ${y}px)`;
+        }
+        requestAnimationFrame(sway);
+      };
+      sway();
+    };
+    window.addEventListener('DOMContentLoaded', swayBuzzcut);
+
+    // Locations mapping
+    const locations = {
+      "Chennai Central": [13.0827,80.2707],
+      "Egmore": [13.0820,80.2616],
+      "Guindy": [13.0067,80.2206],
+      "Koyambedu": [13.0732,80.2057],
+      "T. Nagar": [13.0420,80.2337],
+      "Velachery": [12.9756,80.2214]
+    };
+
+    // Tab switching logic for home page
+    function switchTab(tab) {
+      const busesTab = document.getElementById('showBusesTab');
+      const altTab = document.getElementById('alternateTab');
+      const busForm = document.getElementById('busFormContainer');
+      const altWays = document.getElementById('altWaysContainer');
+      if (tab === 'buses') {
+        busesTab.classList.add('active');
+        altTab.classList.remove('active');
+        busForm.style.display = '';
+        altWays.style.display = 'none';
+        document.body.style.background = "var(--skyblue)";
+      } else {
+        busesTab.classList.remove('active');
+        altTab.classList.add('active');
+        busForm.style.display = 'none';
+        altWays.style.display = '';
+        document.body.style.background = "#7ecbff";
+        renderMetroAlternateWays();
+      }
+    }
+
+    // Fill and stylize Metro/Train info for Alternate Ways tab with arrival timings, no links
+    function renderMetroAlternateWays() {
+      // Blue Line Data
+      const blueStations = [
+        "Washermenpet","Mannadi","High Court","Central","Egmore","Nehru Park","Kilpauk","Pachaiyappa's College",
+        "Anna Nagar East","Anna Nagar Tower","Thirumangalam","Koyambedu","CMBT","Arumbakkam","Vadapalani",
+        "Ashok Nagar","Ekkatuthangal","Alandur","Nanganallur Road","Meenambakkam","Airport"
+      ];
+      const blueArrivals = ["6:00 AM", "6:10 AM", "6:20 AM", "6:30 AM", "6:40 AM", "6:50 AM", "7:00 AM", "7:10 AM", "7:20 AM", "7:30 AM"];
+      document.getElementById('blueLineDetail').innerHTML = `
+        <div class="metro-row"><b>Route:</b> Airport – Washermenpet (${blueStations.length} stations)</div>
+        <div class="metro-row"><b>First Train:</b> 6:00 AM &nbsp;&nbsp; <b>Last Train:</b> 10:00 PM</div>
+        <div class="metro-row"><b>Frequency:</b> Every 7–10 min (peak), 10–15 min (off-peak)</div>
+        <div class="metro-row"><b>Upcoming Arrivals:</b> ${blueArrivals.join(', ')}</div>
+        <div class="metro-row"><b>Key Stations:</b></div>
+        <ul class="metro-stations-list">${blueStations.map(s=>`<li>${s}</li>`).join('')}</ul>
+      `;
+
+      // Green Line Data
+      const greenStations = [
+        "Central","Government Estate","LIC","Thousand Lights","Nandanam","Saidapet","Little Mount","Guindy","St. Thomas Mount"
+      ];
+      const greenArrivals = ["6:05 AM", "6:15 AM", "6:25 AM", "6:35 AM", "6:45 AM", "6:55 AM", "7:05 AM", "7:15 AM", "7:25 AM"];
+      document.getElementById('greenLineDetail').innerHTML = `
+        <div class="metro-row"><b>Route:</b> St. Thomas Mount – Central (${greenStations.length} stations)</div>
+        <div class="metro-row"><b>First Train:</b> 6:00 AM &nbsp;&nbsp; <b>Last Train:</b> 10:00 PM</div>
+        <div class="metro-row"><b>Frequency:</b> Every 7–10 min (peak)</div>
+        <div class="metro-row"><b>Upcoming Arrivals:</b> ${greenArrivals.join(', ')}</div>
+        <div class="metro-row"><b>Key Stations:</b></div>
+        <ul class="metro-stations-list">${greenStations.map(s=>`<li>${s}</li>`).join('')}</ul>
+      `;
+
+      // Suburban Data
+      const suburbanArrivals = ["6:00 AM", "6:12 AM", "6:23 AM", "6:34 AM", "6:46 AM", "6:58 AM", "7:10 AM"];
+      document.getElementById('suburbanDetail').innerHTML = `
+        <div class="metro-row"><b>Main Lines:</b></div>
+        <ul>
+          <li><b>Beach–Tambaram–Chengalpattu:</b> Frequent services from ~4:00 AM to 11:00 PM. Main stops: Chennai Beach, Park, Egmore, Mambalam, Guindy, Saidapet, Tambaram, Chengalpattu.</li>
+          <li><b>Central–Gummidipoondi & Central–Arakkonam:</b> Regular trains from Chennai Central to northern and western suburbs.</li>
+        </ul>
+        <div class="metro-row"><b>Upcoming Arrivals:</b> ${suburbanArrivals.join(', ')}</div>
+      `;
+    }
+
+    // --- MAP PAGE LOGIC ---
+    let busMap = null;
+    let busMarkers = [];
+    let pickupMarker = null, destMarker = null;
+    let lastPickup = '', lastDest = '';
+    let busListData = []; // Buses for rendering list and selection
+
+    document.getElementById('routeForm').onsubmit = function(e) {
+      e.preventDefault();
+      const pickup = document.getElementById('pickup').value;
+      const dest = document.getElementById('destination').value;
+      if (!pickup || !dest || pickup===dest) {
+        alert('Please select different pickup and destination.');
+        return;
+      }
+      lastPickup = pickup;
+      lastDest = dest;
+      showMapPage(pickup, dest);
+    };
+
+    function showMapPage(pickup, dest) {
+      document.getElementById('mainPage').style.display = 'none';
+      document.getElementById('busMapPage').style.display = 'flex';
+      setTimeout(()=>initBusMap(pickup, dest), 100);
+    }
+
+    function goBackToMain() {
+      document.getElementById('busMapPage').style.display = 'none';
+      document.getElementById('mainPage').style.display = '';
+      if (busMap) {
+        busMarkers.forEach(m=>busMap.removeLayer(m));
+        if (pickupMarker) busMap.removeLayer(pickupMarker);
+        if (destMarker) busMap.removeLayer(destMarker);
+      }
+      busMarkers = [];
+      busListData = [];
+      pickupMarker = null;
+      destMarker = null;
+      closeBusAIPopup();
+    }
+
+    function getRandomNearby(lat, lng, radius=0.01) {
+      const r = Math.random() * radius;
+      const angle = Math.random() * 2 * Math.PI;
+      const dlat = r * Math.cos(angle);
+      const dlng = r * Math.sin(angle);
+      return [lat + dlat, lng + dlng];
+    }
+
+    function getNearbyBuses(pickupLoc, n=5) {
+      const [lat, lng] = locations[pickupLoc];
+      let buses = [];
+      for(let i=0;i<n;i++){
+        const [blat, blng] = getRandomNearby(lat, lng, 0.018);
+        const eta = Math.floor(Math.random()*12)+3;
+        const crowdTypes = ["free", "moderate", "full"];
+        const crowd = crowdTypes[Math.floor(Math.random()*3)];
+        buses.push({lat: blat, lng: blng, busNo: "TN01-" + (Math.floor(Math.random()*900)+100), eta, crowd});
+      }
+      return buses;
+    }
+
+    function initBusMap(pickup, dest) {
+      const chennaiCenter = [13.0827,80.2707];
+      if (!busMap) {
+        busMap = L.map('busMap', {zoomControl:true}).setView(chennaiCenter, 12);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          attribution: '© OpenStreetMap contributors'
+        }).addTo(busMap);
+      }
+      busMarkers.forEach(m=>busMap.removeLayer(m));
+      if (pickupMarker) busMap.removeLayer(pickupMarker);
+      if (destMarker) busMap.removeLayer(destMarker);
+      busMarkers = [];
+
+      pickupMarker = L.marker(locations[pickup], {
+        icon: L.divIcon({
+          className: 'pickup-marker',
+          html: `<div style="background:#388e3c;border-radius:50%;width:30px;height:30px;display:flex;align-items:center;justify-content:center;font-size:17px;color:#fff;">P</div>`,
+          iconSize: [30,30], iconAnchor: [15,15]
+        })
+      }).addTo(busMap).bindPopup("Pickup: "+pickup);
+
+      destMarker = L.marker(locations[dest], {
+        icon: L.divIcon({
+          className: 'dest-marker',
+          html: `<div style="background:#e53935;border-radius:50%;width:30px;height:30px;display:flex;align-items:center;justify-content:center;font-size:17px;color:#fff;">D</div>`,
+          iconSize: [30,30], iconAnchor: [15,15]
+        })
+      }).addTo(busMap).bindPopup("Destination: "+dest);
+
+      let bounds = L.latLngBounds([locations[pickup], locations[dest]]);
+      busMap.fitBounds(bounds, {padding:[60,60]});
+
+      busListData = getNearbyBuses(pickup, 6+Math.floor(Math.random()*3));
+      busMarkers = busListData.map((bus, idx) =>
+        L.marker([bus.lat, bus.lng], {
+          icon: L.divIcon({
+            className:'bus-marker',
+            html:`<div style="background:#e53935;border-radius:50%;width:26px;height:26px;display:flex;align-items:center;justify-content:center;font-size:16px;">🚌</div>`,
+            iconSize:[26,26],iconAnchor:[13,13]
+          })
+        }).addTo(busMap).bindPopup(`<b>Bus ${bus.busNo}</b><br>ETA: ${bus.eta} min<br>Crowd: <span class="crowd ${bus.crowd}">${bus.crowd}</span>`)
+        .on('click', ()=>selectBus(idx))
+      );
+      renderBusListMin();
+    }
+
+    function renderBusListMin(selectedIdx) {
+      document.getElementById('busListMin').innerHTML = busListData.map((bus, idx) =>
+        `<div class="bus-card${selectedIdx===idx?' selected':''}" onclick="selectBus(${idx})">
+          <div class="bus-info"><b>${bus.busNo}</b> &ndash; ETA: ${bus.eta} min</div>
+          <span class="crowd ${bus.crowd}">${bus.crowd}</span>
+        </div>`
+      ).join('');
+    }
+
+    function predictCrowdLevelPercent(bus, pickup) {
+      let base = bus.crowd === "free" ? Math.random() * 35 + 5
+                : bus.crowd === "moderate" ? Math.random() * 30 + 40
+                : Math.random() * 30 + 70;
+      base = Math.round(base);
+      if (base < 4) base = 4;
+      if (base > 99) base = 99;
+      return base;
+    }
+    function comfortTextPercent(percent) {
+      if (percent <= 35) return {txt: "Good (Spacious, likely seats)", cls: "bus-ai-comfort-good"};
+      if (percent <= 70) return {txt: "Average (Some standing, possible seats)", cls: ""};
+      return {txt: "Low (Crowded, likely standing)", cls: "bus-ai-comfort-bad"};
+    }
+    function crowdLabelFromPercent(percent) {
+      if (percent <= 35) return {label: "Free", cls: "free"};
+      if (percent <= 70) return {label: "Moderate", cls: "moderate"};
+      return {label: "Full", cls: "full"};
+    }
+    function showBusAIPopup(bus, pickup) {
+      const predPercent = predictCrowdLevelPercent(bus, pickup);
+      const crowd = crowdLabelFromPercent(predPercent);
+      const comfort = comfortTextPercent(predPercent);
+      document.getElementById('busAIContent').innerHTML = `
+        <div>
+          <b>Bus:</b> ${bus.busNo}<br>
+          <b>Predicted crowd at <span style="color:#ffd600;">${pickup}</span>:</b>
+          <div class="bus-ai-pred-crowd">
+            <span class="bus-ai-crowd-ind ${crowd.cls}">${crowd.label}</span>
+            <span style="font-size:1.11em; font-weight:bold; color:#ffd600;">${predPercent}%</span>
+          </div>
+          <b>Comfort:</b>
+          <span class="${comfort.cls}">${comfort.txt}</span>
+        </div>
+      `;
+      document.getElementById('freqPopupContentInside').style.display = 'none';
+      document.getElementById('freqBtnInside').innerText = "Show Frequency";
+      const popup = document.getElementById('busAIPopup');
+      popup.classList.add('active');
+      window._lastSelectedBusIdx = busListData.indexOf(bus);
+    }
+    function closeBusAIPopup() {
+      document.getElementById('busAIPopup').classList.remove('active');
+    }
+    window.selectBus = function(idx) {
+      renderBusListMin(idx);
+      if (busMarkers[idx]) busMarkers[idx].openPopup();
+      if (busListData[idx]) showBusAIPopup(busListData[idx], lastPickup);
+      window._lastSelectedBusIdx = idx;
+    };
+    function toggleFreqContent() {
+      let idx = window._lastSelectedBusIdx;
+      let bus = idx !== undefined && busListData[idx] ? busListData[idx] : null;
+      let pickup = lastPickup || "the selected stop";
+      let freq = '';
+      const freqDiv = document.getElementById('freqPopupContentInside');
+      const btn = document.getElementById('freqBtnInside');
+      if (freqDiv.style.display === 'block') {
+        freqDiv.style.display = 'none';
+        btn.innerText = "Show Frequency";
+        return;
+      }
+      if (!bus) {
+        freq = "Please select a bus to view its frequency.";
+      } else {
+        let freqNum, freqTxt;
+        if (bus.crowd === "free") {
+          freqNum = Math.floor(Math.random() * 8) + 20;
+          freqTxt = "Low (arrives less often)";
+        } else if (bus.crowd === "moderate") {
+          freqNum = Math.floor(Math.random() * 6) + 12;
+          freqTxt = "Medium frequency";
+        } else {
+          freqNum = Math.floor(Math.random() * 5) + 5;
+          freqTxt = "High frequency";
+        }
+        freq = `<b>Bus:</b> ${bus.busNo}<br>
+        <b>Frequency at ${pickup}:</b> <span style="color:#ffd600;font-weight:bold;">Every ${freqNum} min</span><br>
+        <b>Frequency level:</b> <span style="font-weight:bold;color:#e53935;">${freqTxt}</span><br>
+        <small style="color:#fff8;">(Estimated based on city transit patterns)</small>`;
+      }
+      freqDiv.innerHTML = freq;
+      freqDiv.style.display = 'block';
+      btn.innerText = "Hide Frequency";
+    }
+    document.addEventListener('keydown', function(e){
+      if (e.key === "Escape") {
+        closeBusAIPopup();
+      }
+    });
+
+    // Initial tab state and alternate ways rendering
+    document.addEventListener('DOMContentLoaded', function() {
+      switchTab('buses');
+      renderMetroAlternateWays();
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,1977 @@
+##--> comment
+
+##bus api(python)
+
+# bus_api.py
+# Flask API for bus pipeline: IN/OUT counting + ETA prediction + retraining
+
+import os
+import math
+import json
+import cv2
+import numpy as np
+import pandas as pd
+from collections import defaultdict
+from datetime import datetime
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from ultralytics import YOLO
+import joblib
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+app = Flask(__name__)
+
+# Enable CORS for all routes and origins
+CORS(app, resources={
+    r"/*": {
+        "origins": "*",
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization", "Access-Control-Allow-Credentials"],
+        "supports_credentials": True
+    }
+})
+
+# Alternative: Enable CORS for specific origins only (more secure for production)
+# CORS(app, resources={
+#     r"/*": {
+#         "origins": ["http://localhost:3000", "http://localhost:8080", "https://yourdomain.com"],
+#         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+#         "allow_headers": ["Content-Type", "Authorization"],
+#     }
+# })
+
+# ==============================
+# Shared config
+# ==============================
+MODEL_PATH = "bus_eta_linear_model.pkl"
+ENC_PATH = "label_encoders.pkl"
+
+CROWD_MODEL_PATH = "bus_crowd_model.pkl"
+CROWD_ENC_PATH = "crowd_label_encoders.pkl"
+
+ETA_FEATURES = [
+    "distance_km", "hour", "day_of_week", "is_weekend", "is_peak_hour",
+    "current_passengers", "bus_capacity", "stops_remaining", "avg_stop_time",
+    "traffic_multiplier", "weather_delay_factor", "buses_per_hour_at_stop",
+    "route_type_encoded", "origin_encoded", "destination_encoded", "weather_encoded",
+    "passengers_per_km", "capacity_utilization", "total_stop_time"
+]
+
+CROWD_FEATURES = [
+    "distance_km", "hour", "day_of_week", "is_weekend", "is_peak_hour",
+    "stops_remaining", "avg_stop_time", "traffic_multiplier",
+    "weather_delay_factor", "buses_per_hour_at_stop",
+    "route_type_encoded", "origin_encoded", "destination_encoded", "weather_encoded",
+    "passengers_per_km", "total_stop_time"
+]
+
+CAT_COLS = ["route_type", "origin", "destination", "weather"]
+
+# ==============================
+# Utility: ETA helpers
+# ==============================
+def _load_or_init_model_and_encoders():
+    if os.path.exists(MODEL_PATH) and os.path.exists(ENC_PATH):
+        model = joblib.load(MODEL_PATH)
+        encoders = joblib.load(ENC_PATH)
+    else:
+        model = LinearRegression()
+        encoders = {}
+    return model, encoders
+
+def _load_or_init_crowd_model_and_encoders():
+    if os.path.exists(CROWD_MODEL_PATH) and os.path.exists(CROWD_ENC_PATH):
+        model = joblib.load(CROWD_MODEL_PATH)
+        encoders = joblib.load(CROWD_ENC_PATH)
+    else:
+        model = LinearRegression()
+        encoders = {}
+    return model, encoders
+
+def _ensure_encoders(encoders, df):
+    for col in CAT_COLS:
+        if col not in encoders:
+            le = LabelEncoder()
+            encoders[col] = le.fit(df[col].astype(str).fillna("UNKNOWN"))
+        le = encoders[col]
+        known = set(le.classes_.tolist())
+        def trans(val):
+            s = str(val) if pd.notna(val) else "UNKNOWN"
+            if s in known:
+                return le.transform([s])[0]
+            else:
+                return -1
+        df[col + "_encoded"] = df[col].apply(trans)
+    return encoders, df
+
+def _add_derived_features(df):
+    df = df.copy()
+    df["passengers_per_km"] = df["current_passengers"] / df["distance_km"].replace(0, np.nan)
+    df["passengers_per_km"] = df["passengers_per_km"].fillna(0.0)
+    df["capacity_utilization"] = df["current_passengers"] / df["bus_capacity"].replace(0, np.nan)
+    df["capacity_utilization"] = df["capacity_utilization"].fillna(0.0)
+    df["total_stop_time"] = df["stops_remaining"] * df["avg_stop_time"]
+    return df
+
+def _predict_eta_from_sample_dict(sample, model, encoders):
+    df = pd.DataFrame([sample])
+    encoders, df = _ensure_encoders(encoders, df)
+    df = _add_derived_features(df)
+    X = pd.DataFrame([df.iloc[0][ETA_FEATURES]])
+    pred = float(model.predict(X)[0])
+    return round(pred, 2)
+
+def _predict_crowd_from_sample_dict(sample, model, encoders):
+    df = pd.DataFrame([sample])
+    encoders, df = _ensure_encoders(encoders, df)
+    df = _add_derived_features(df)
+    # crowd percentage = passengers / capacity * 100
+    if df["bus_capacity"].iloc[0] > 0:
+        df["crowd_percentage"] = (df["current_passengers"] / df["bus_capacity"]) * 100
+    else:
+        df["crowd_percentage"] = 0
+    X = pd.DataFrame([df.iloc[0][CROWD_FEATURES]])
+    pred = float(model.predict(X)[0])
+    return round(pred, 2)
+
+# ==============================
+# Utility: IN/OUT Counter (YOLOv8)
+# ==============================
+def signed_distance_to_line(p, a, b):
+    ax, ay = a
+    bx, by = b
+    px, py = p
+    vx, vy = bx - ax, by - ay
+    nx, ny = -vy, vx
+    apx, apy = px - ax, py - ay
+    return apx * nx + apy * ny
+
+def run_counter(video_path, save_path="annotated.mp4", log_path="log.csv",
+                line=((100, 100), (400, 100)), model_name="yolov8s.pt",
+                conf=0.35, swap=False):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_path}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(save_path, fourcc, fps, (W, H))
+
+    import csv
+    log_f = open(log_path, "w", newline="")
+    log_writer = csv.writer(log_f)
+    log_writer.writerow(["timestamp", "frame_index", "delta_in", "delta_out", "cum_in", "cum_out"])
+
+    model = YOLO(model_name)
+
+    last_side = {}
+    last_centroid = {}
+    last_cross_frame = defaultdict(lambda: -9999)
+    cooldown = int(fps * 0.3)
+    min_move = 8
+    eps = 3
+    in_count, out_count, frame_index = 0, 0, 0
+
+    a, b = line
+    results_gen = model.track(source=video_path, stream=True, persist=True,
+                              verbose=False, conf=conf, iou=0.5, classes=[0])
+
+    for res in results_gen:
+        frame = res.orig_img.copy()
+        delta_in, delta_out = 0, 0
+        if res.boxes is not None and len(res.boxes) > 0:
+            xyxy = res.boxes.xyxy.cpu().numpy()
+            ids = res.boxes.id.cpu().numpy().astype(int) if res.boxes.id is not None else None
+            clss = res.boxes.cls.cpu().numpy().astype(int)
+            for i in range(len(xyxy)):
+                if clss[i] != 0:
+                    continue
+                x1, y1, x2, y2 = xyxy[i].astype(int)
+                cx, cy = int((x1+x2)/2), int((y1+y2)/2)
+                tid = int(ids[i]) if ids is not None and i < len(ids) else None
+                if tid is None: continue
+                side = signed_distance_to_line((cx, cy), a, b)
+                if tid not in last_side:
+                    last_side[tid] = side
+                    last_centroid[tid] = (cx, cy)
+                    continue
+                prev_side = last_side[tid]
+                pcx, pcy = last_centroid[tid]
+                move_dist = math.hypot(cx-pcx, cy-pcy)
+                crossed = False
+                now_pos, prev_pos = side >= eps, prev_side >= eps
+                now_neg, prev_neg = side <= -eps, prev_side <= -eps
+                crossing_dir = None
+                if prev_neg and now_pos: crossed, crossing_dir = True, "neg_to_pos"
+                elif prev_pos and now_neg: crossed, crossing_dir = True, "pos_to_neg"
+                if crossed and move_dist>=min_move and (frame_index-last_cross_frame[tid]>cooldown):
+                    if swap:
+                        if crossing_dir=="neg_to_pos": out_count+=1; delta_out+=1
+                        elif crossing_dir=="pos_to_neg": in_count+=1; delta_in+=1
+                    else:
+                        if crossing_dir=="neg_to_pos": in_count+=1; delta_in+=1
+                        elif crossing_dir=="pos_to_neg": out_count+=1; delta_out+=1
+                    last_cross_frame[tid] = frame_index
+                last_side[tid] = side
+                last_centroid[tid] = (cx, cy)
+        writer.write(frame)
+        log_writer.writerow([datetime.now().isoformat(), frame_index, delta_in, delta_out, in_count, out_count])
+        frame_index += 1
+
+    writer.release()
+    log_f.close()
+    return {"in": in_count, "out": out_count, "video": save_path, "log": log_path}
+
+# ==============================
+# Error Handlers
+# ==============================
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({"error": "Endpoint not found"}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({"error": "Internal server error"}), 500
+
+@app.errorhandler(400)
+def bad_request(error):
+    return jsonify({"error": "Bad request"}), 400
+
+# ==============================
+# Flask Endpoints
+# ==============================
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({
+        "message": "Bus API Server",
+        "version": "1.0.0",
+        "endpoints": {
+            "/start": "GET - Health check",
+            "/predict": "POST - Predict ETA",
+            "/predict_crowd": "POST - Predict crowd percentage",
+            "/count": "POST - Count people in/out from video",
+            "/retrain": "POST - Retrain ETA model",
+            "/retrain_crowd": "POST - Retrain crowd model"
+        }
+    })
+
+@app.route("/start", methods=["GET", "POST"])
+def start():
+    return jsonify({
+        'message': 'Connected!',
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat()
+    })
+
+@app.route("/predict", methods=["POST", "OPTIONS"])
+def predict():
+    if request.method == "OPTIONS":
+        return jsonify({"message": "CORS preflight"}), 200
+    
+    try:
+        sample = request.get_json(force=True)
+        if not sample:
+            return jsonify({"error": "No JSON data provided"}), 400
+            
+        model, encoders = _load_or_init_model_and_encoders()
+        if not hasattr(model, "predict"):
+            return jsonify({"error": "Model not trained yet. Use /retrain first"}), 400
+            
+        eta = _predict_eta_from_sample_dict(sample, model, encoders)
+        return jsonify({
+            "eta_minutes": eta,
+            "status": "success",
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({"error": f"Prediction failed: {str(e)}"}), 500
+
+@app.route("/retrain", methods=["POST", "OPTIONS"])
+def retrain():
+    if request.method == "OPTIONS":
+        return jsonify({"message": "CORS preflight"}), 200
+    
+    try:
+        data = request.get_json(force=True)
+        if not data:
+            return jsonify({"error": "No JSON data provided"}), 400
+            
+        new_csv = data.get("new_csv")
+        old_csv = data.get("old_csv")
+        test_size = float(data.get("test_size", 0.2))
+        
+        if not new_csv:
+            return jsonify({"error": "new_csv parameter is required"}), 400
+            
+        if not os.path.exists(new_csv):
+            return jsonify({"error": f"new_csv not found: {new_csv}"}), 400
+            
+        new_df = pd.read_csv(new_csv)
+        if old_csv and os.path.exists(old_csv):
+            full_df = pd.concat([pd.read_csv(old_csv), new_df], ignore_index=True)
+        else:
+            full_df = new_df
+            
+        encoders = {}
+        encoders, full_df = _ensure_encoders(encoders, full_df)
+        full_df = _add_derived_features(full_df)
+        
+        X, y = full_df[ETA_FEATURES], full_df["eta_minutes"]
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
+        
+        model = LinearRegression()
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+        
+        mae = mean_absolute_error(y_test, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        
+        joblib.dump(model, MODEL_PATH)
+        joblib.dump(encoders, ENC_PATH)
+        
+        return jsonify({
+            "mae": mae,
+            "rmse": rmse,
+            "model_path": MODEL_PATH,
+            "status": "success",
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({"error": f"Retraining failed: {str(e)}"}), 500
+
+@app.route("/predict_crowd", methods=["POST", "OPTIONS"])
+def predict_crowd():
+    if request.method == "OPTIONS":
+        return jsonify({"message": "CORS preflight"}), 200
+    
+    try:
+        sample = request.get_json(force=True)
+        if not sample:
+            return jsonify({"error": "No JSON data provided"}), 400
+            
+        model, encoders = _load_or_init_crowd_model_and_encoders()
+        if not hasattr(model, "predict"):
+            return jsonify({"error": "Crowd model not trained yet. Use /retrain_crowd first"}), 400
+            
+        crowd = _predict_crowd_from_sample_dict(sample, model, encoders)
+        return jsonify({
+            "crowd_percentage": crowd,
+            "status": "success",
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({"error": f"Crowd prediction failed: {str(e)}"}), 500
+
+@app.route("/retrain_crowd", methods=["POST", "OPTIONS"])
+def retrain_crowd():
+    if request.method == "OPTIONS":
+        return jsonify({"message": "CORS preflight"}), 200
+    
+    try:
+        data = request.get_json(force=True)
+        if not data:
+            return jsonify({"error": "No JSON data provided"}), 400
+            
+        new_csv = data.get("new_csv")
+        old_csv = data.get("old_csv")
+        test_size = float(data.get("test_size", 0.2))
+        
+        if not new_csv:
+            return jsonify({"error": "new_csv parameter is required"}), 400
+            
+        if not os.path.exists(new_csv):
+            return jsonify({"error": f"new_csv not found: {new_csv}"}), 400
+            
+        new_df = pd.read_csv(new_csv)
+        if old_csv and os.path.exists(old_csv):
+            full_df = pd.concat([pd.read_csv(old_csv), new_df], ignore_index=True)
+        else:
+            full_df = new_df
+            
+        encoders = {}
+        encoders, full_df = _ensure_encoders(encoders, full_df)
+        full_df = _add_derived_features(full_df)
+        full_df["crowd_percentage"] = (full_df["current_passengers"] / full_df["bus_capacity"]) * 100
+        
+        X, y = full_df[CROWD_FEATURES], full_df["crowd_percentage"]
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
+        
+        model = LinearRegression()
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+        
+        mae = mean_absolute_error(y_test, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        
+        joblib.dump(model, CROWD_MODEL_PATH)
+        joblib.dump(encoders, CROWD_ENC_PATH)
+        
+        return jsonify({
+            "mae": mae,
+            "rmse": rmse,
+            "model_path": CROWD_MODEL_PATH,
+            "status": "success",
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({"error": f"Crowd model retraining failed: {str(e)}"}), 500
+
+@app.route("/count", methods=["POST", "OPTIONS"])
+def count():
+    if request.method == "OPTIONS":
+        return jsonify({"message": "CORS preflight"}), 200
+    
+    try:
+        data = request.get_json(force=True)
+        if not data:
+            return jsonify({"error": "No JSON data provided"}), 400
+            
+        video_path = data.get("video_path")
+        if not video_path:
+            return jsonify({"error": "video_path parameter is required"}), 400
+            
+        if not os.path.exists(video_path):
+            return jsonify({"error": f"Video file not found: {video_path}"}), 400
+            
+        save_path = data.get("save_path", "annotated.mp4")
+        log_path = data.get("log_path", "log.csv")
+        line = tuple(map(tuple, data.get("line", [(100,100),(400,100)])))
+        conf = float(data.get("conf", 0.35))
+        swap = bool(data.get("swap", False))
+        
+        result = run_counter(
+            video_path, 
+            save_path=save_path, 
+            log_path=log_path, 
+            line=line,
+            conf=conf,
+            swap=swap
+        )
+        
+        result.update({
+            "status": "success",
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": f"Counting failed: {str(e)}"}), 500
+
+# ==============================
+# Additional Utility Endpoints
+# ==============================
+@app.route("/status", methods=["GET"])
+def status():
+    eta_model_exists = os.path.exists(MODEL_PATH)
+    crowd_model_exists = os.path.exists(CROWD_MODEL_PATH)
+    
+    return jsonify({
+        "api_status": "running",
+        "models": {
+            "eta_model": {
+                "exists": eta_model_exists,
+                "path": MODEL_PATH
+            },
+            "crowd_model": {
+                "exists": crowd_model_exists,
+                "path": CROWD_MODEL_PATH
+            }
+        },
+        "timestamp": datetime.now().isoformat()
+    })
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat()
+    }), 200
+
+# ==============================
+# Run
+# ==============================
+if __name__ == "__main__":
+    print("Starting Bus API Server...")
+    print("CORS enabled for all origins")
+    print("Available endpoints:")
+    print("  GET  /          - API information")
+    print("  GET  /start     - Health check")
+    print("  GET  /status    - Model status")
+    print("  GET  /health    - Health check")
+    print("  POST /predict   - Predict ETA")
+    print("  POST /predict_crowd - Predict crowd percentage")
+    print("  POST /count     - Count people in/out from video")
+    print("  POST /retrain   - Retrain ETA model")
+    print("  POST /retrain_crowd - Retrain crowd model")
+    print("\nServer running on http://0.0.0.0:5000")
+
+## bu_eta_linear_model.pkl
+    
+€•N      Œsklearn.linear_model._base”ŒLinearRegression”“”)”}”(Œ
+fit_intercept”ˆŒcopy_X”ˆŒn_jobs”NŒpositive”‰Œfeature_names_in_”Œjoblib.numpy_pickle”ŒNumpyArrayWrapper”“”)”}”(Œsubclass”Œnumpy”Œ ndarray”“”Œshape”K…”Œorder”ŒC”Œdtype”hŒdtype”“”ŒO8”‰ˆ‡”R”(KŒ|”NNNJÿÿÿÿJÿÿÿÿK?t”bŒ
+allow_mmap”‰Œnumpy_array_alignment_bytes”Kub€•ß      Œnumpy._core.multiarray”Œ_reconstruct”“”Œnumpy”Œ ndarray”“”K …”Cb”‡”R”(KK…”hŒdtype”“”ŒO8”‰ˆ‡”R”(KŒ|”NNNJÿÿÿÿJÿÿÿÿK?t”b‰]”(Œ
+distance_km”Œhour”Œ
+day_of_week”Œ
+is_weekend”Œis_peak_hour”Œcurrent_passengers”Œbus_capacity”Œstops_remaining”Œ
+avg_stop_time”Œtraffic_multiplier”Œweather_delay_factor”Œbuses_per_hour_at_stop”Œroute_type_encoded”Œorigin_encoded”Œdestination_encoded”Œweather_encoded”Œpassengers_per_km”Œcapacity_utilization”Œtotal_stop_time”et”b.•b       Œn_features_in_”KŒcoef_”h)”}”(hhhK…”hhhhŒf8”‰ˆ‡”R”(KŒ<”NNNJÿÿÿÿJÿÿÿÿK t”bhˆh Kubÿº)ŒœX[@ ƒ:ìÄg¿±ÒûÊ†¿O)ç—›…:¿2Cí&Ñµ?uÚõYw½?…5OdªŠ¿ú÷	¶º}¿–‹y»k)·¿*þ¾óûJ@	Ù˜Ç‡:K@ß H?øù¿¡éJqw
+–¿FÑîsb¿Û
+‡±„P¿‡hÆO‚÷¿7LÇð8iî¿ú†tç¿iÐX•™íŠ?•9       Œrank_”KŒ	singular_”h)”}”(hhhK…”hhhh(hˆh Kubÿÿÿÿÿ«$=Ç­@^¸õ°(©@`*wß†¨@%[I6Ö @Ò5é†£Ÿ@§Ö1°snž@ÉÐÆ:JÜš@O;Ã“Ÿ‘@6'\F×èƒ@¬îAU¤@ß4û[à€@ûF}néx@žB®T<Âs@ ‰áÜ–\@	\êõìèR@Žt[©1±L@^p×w¹ˆF@:	E KÊD@{paÜ@•`       Œ
+intercept_”Œnumpy._core.multiarray”Œscalar”“”h(C-a¹:Çƒ^À”†”R”Œ_sklearn_version”Œ1.6.1”ub.
+
+## buzzcut_tracker(HTML)
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>BuzzCut - Your Bus Guide</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
+  <!-- Cabin for body, Italianno for title -->
+  <link href="https://fonts.googleapis.com/css2?family=Cabin:wght@400;600;700&family=Italianno&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-routing-machine@3.2.12/dist/leaflet-routing-machine.css" />
+  <style>
+    :root {
+      --red: #e53935;
+      --lightgrey: #ececec;
+      --darkgrey: #232526;
+      --gradient: linear-gradient(135deg, #232526 0%, #e53935 100%);
+    }
+    html, body {
+      height: 100%;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      min-height: 100vh;
+      background: var(--gradient);
+      font-family: 'Cabin', sans-serif;
+      color: #fff;
+      margin: 0;
+      letter-spacing: 0.01em;
+      overflow-x: hidden;
+    }
+    .buzzcut-title {
+      font-family: 'Italianno', cursive;
+      font-size: 3.8em;
+      text-align: center;
+      color: #fff;
+      margin-top: 1.2em;
+      margin-bottom: 0.1em;
+      letter-spacing: 2px;
+      text-shadow: 0 3px 16px #e5393550, 0 1px 0 #232526aa, 0 0 40px #e5393530;
+      font-weight: normal;
+      display: flex;
+      justify-content: center;
+      gap: 0.04em;
+      user-select: none;
+    }
+    .buzzcut-letter {
+      display: inline-block;
+      will-change: transform;
+    }
+    .subtitle {
+      text-align:center;
+      font-size:1.28em;
+      color: #fff8;
+      margin-bottom:2em;
+      letter-spacing:2px;
+      font-family: 'Times New Roman', Times, serif;
+      font-weight: 700;
+      text-shadow: 0 2px 8px #00000040;
+    }
+    .container {
+      max-width: 1440px;
+      margin: 0 auto;
+      background: rgba(255,255,255,0.08);
+      border-radius: 20px;
+      padding: 2.5em 2.5em 2.5em 2.5em;
+      box-shadow: 0 0 30px #00000030, 0 10px 40px #e5393520;
+      margin-top: 1.5em;
+      margin-bottom: 2em;
+      position: relative;
+      backdrop-filter: blur(8px);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      border: 1px solid rgba(255,255,255,0.1);
+    }
+    .input-row {
+      display: flex;
+      gap: 1.2em;
+      margin-bottom: 1.8em;
+      width: 100%;
+      max-width: 800px;
+      justify-content: center;
+    }
+    .location-bar {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      font-size: 1.1em;
+      color: #fff;
+      margin-bottom: 0.2em;
+      min-width: 220px;
+      max-width: 430px;
+    }
+    .location-label {
+      font-weight: 700;
+      font-size: 1.12em;
+      margin-bottom: 10px;
+      color: #fff;
+      letter-spacing: .8px;
+      text-shadow: 0 1px 3px #00000040;
+    }
+    select {
+      width: 100%;
+      margin-top: 0.2em;
+      padding: 1.15em 1.3em;
+      border-radius: 15px;
+      border: none;
+      background: rgba(255,255,255,0.92);
+      color: #222;
+      font-size: 1.18em;
+      font-family: 'Cabin',sans-serif;
+      box-shadow: 0 5px 20px rgba(229,57,53,0.15), 0 2px 8px rgba(0,0,0,0.1);
+      outline: none;
+      font-weight: 700;
+      transition: all .25s cubic-bezier(0.4, 0, 0.2, 1);
+      border: 2.5px solid transparent;
+      min-width: 160px;
+      max-width: 430px;
+      margin-bottom: 0.5em;
+    }
+    select:focus {
+      border: 2.5px solid var(--red);
+      box-shadow: 0 0 0 6px rgba(229,57,53,0.25), 0 8px 25px rgba(229,57,53,0.3);
+      background: #fff;
+      transform: translateY(-1px);
+    }
+    select:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 8px 25px rgba(229,57,53,0.2), 0 2px 8px rgba(0,0,0,0.15);
+    }
+    .button-row {
+      display: flex;
+      gap: 1em;
+      margin: 1.2em 0 1.6em 0;
+      align-items: center;
+      justify-content: center;
+    }
+    button, .alt-btn {
+      padding: 1em 2.5em;
+      background: var(--red);
+      color: #fff;
+      border: none;
+      border-radius: 13px;
+      font-size: 1.18em;
+      font-family: 'Cabin',sans-serif;
+      font-weight: bold;
+      cursor: pointer;
+      box-shadow: 0 4px 15px rgba(229,57,53,0.35), 0 2px 8px rgba(0,0,0,0.1);
+      transition: all .25s cubic-bezier(0.4, 0, 0.2, 1);
+      letter-spacing: .8px;
+      outline: none;
+      display: inline-block;
+      position: relative;
+      overflow: hidden;
+    }
+    button:hover, .alt-btn:hover {
+      background: #d32f2f;
+      transform: translateY(-2px);
+      box-shadow: 0 8px 25px rgba(229,57,53,0.4), 0 4px 15px rgba(0,0,0,0.2);
+    }
+    button:active, .alt-btn:active {
+      transform: translateY(0px);
+      box-shadow: 0 4px 15px rgba(229,57,53,0.35);
+    }
+    button:disabled {
+      background: #999;
+      cursor: not-allowed;
+      transform: none;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    }
+    .alt-btn {
+      background: rgba(255,255,255,0.15);
+      color: #fff;
+      border: 2px solid rgba(255,255,255,0.3);
+      font-size: 1.08em;
+      padding: 0.9em 2em;
+      backdrop-filter: blur(5px);
+    }
+    .alt-btn:hover {
+      background: rgba(255,255,255,0.25);
+      border: 2px solid rgba(255,255,255,0.6);
+      color: #fff;
+      transform: translateY(-1px);
+    }
+    .loading {
+      display: inline-block;
+      width: 20px;
+      height: 20px;
+      border: 3px solid rgba(255,255,255,0.3);
+      border-radius: 50%;
+      border-top-color: #fff;
+      animation: spin 1s ease-in-out infinite;
+      margin-right: 12px;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    .error-message {
+      background: linear-gradient(135deg, #d32f2f 0%, #b71c1c 100%);
+      color: white;
+      padding: 1.2em 1.5em;
+      border-radius: 12px;
+      margin: 1em 0;
+      font-weight: bold;
+      box-shadow: 0 4px 15px rgba(211,47,47,0.3);
+      border-left: 4px solid #ffcdd2;
+    }
+    .warning-message {
+      background: linear-gradient(135deg, #ff9800 0%, #f57c00 100%);
+      color: white;
+      padding: 1.2em 1.5em;
+      border-radius: 12px;
+      margin: 1em 0;
+      font-weight: bold;
+      box-shadow: 0 4px 15px rgba(255,152,0,0.3);
+      border-left: 4px solid #ffcc02;
+    }
+    .success-message {
+      background: linear-gradient(135deg, #388e3c 0%, #2e7d32 100%);
+      color: white;
+      padding: 1.2em 1.5em;
+      border-radius: 12px;
+      margin: 1em 0;
+      font-weight: bold;
+      box-shadow: 0 4px 15px rgba(56,142,60,0.3);
+      border-left: 4px solid #c8e6c9;
+    }
+    #map {
+      width: 100vw;
+      max-width: 1320px;
+      height: 450px;
+      margin: 2em 0 1em 0;
+      border-radius: 16px;
+      box-shadow: 0 8px 30px rgba(229,57,53,0.25), 0 4px 15px rgba(0,0,0,0.1);
+      background: #222;
+      border: 2px solid rgba(255,255,255,0.1);
+    }
+    .bus-list {
+      margin-top:1.5em;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1.2em;
+      justify-content: center;
+      width: 100%;
+      max-width: 1320px;
+    }
+    .bus-card {
+      background: rgba(255,255,255,0.12);
+      margin:0.5em 0;
+      padding:1.3em 1.8em;
+      border-radius:14px;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      cursor:pointer;
+      transition: all .3s cubic-bezier(0.4, 0, 0.2, 1);
+      border: 2px solid rgba(255,255,255,0.1);
+      font-size: 1.12em;
+      min-width: 280px;
+      max-width: 340px;
+      flex: 1 1 280px;
+      backdrop-filter: blur(10px);
+    }
+    .bus-card:hover {
+      transform: translateY(-3px);
+      box-shadow: 0 10px 30px rgba(255,255,255,0.2);
+      background: rgba(255,255,255,0.18);
+      border-color: rgba(255,255,255,0.3);
+    }
+    .bus-card.selected { 
+      border:2px solid #fff; 
+      box-shadow:0 0 20px rgba(255,255,255,0.4), 0 8px 25px rgba(229,57,53,0.2); 
+      background: rgba(255,255,255,0.2);
+      transform: translateY(-2px);
+    }
+    .bus-info { 
+      font-size:1.16em; 
+      font-weight: 600;
+      text-shadow: 0 1px 3px rgba(0,0,0,0.2);
+    }
+    .crowd { 
+      padding:0.3em 0.9em; 
+      border-radius:8px; 
+      font-weight:bold; 
+      text-transform:capitalize; 
+      font-size:1em;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+    }
+    .crowd.free { background: linear-gradient(135deg, #4caf50 0%, #2e7d32 100%); color:#fff; }
+    .crowd.medium { background: linear-gradient(135deg, #ff9800 0%, #f57c00 100%); color:#fff; }
+    .crowd.full { background: linear-gradient(135deg, #f44336 0%, #c62828 100%); color:#fff; }
+    
+    /* AI Prediction Slide */
+    .ai-prediction-slide {
+      position: fixed;
+      top: 0;
+      right: -560px;
+      width: 560px;
+      height: 100vh;
+      background: linear-gradient(135deg, #fff 0%, #f8f9fa 100%);
+      color: #222;
+      box-shadow: -8px 0 40px rgba(0,0,0,0.15);
+      z-index: 1000;
+      transition: right .5s cubic-bezier(.67,.13,.31,1);
+      font-family:'Cabin',sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      border-left: 6px solid var(--red);
+      overflow-y: auto;
+    }
+    .ai-prediction-slide.show { right:0; }
+    .ai-title {
+      font-size:2.2em;
+      font-weight:700;
+      color:var(--red);
+      margin-bottom:0.2em;
+      text-align: center;
+      width: 100%;
+      text-shadow: 0 2px 4px rgba(229,57,53,0.2);
+    }
+    .ai-tab {
+      width: 94%;
+      margin: 0 auto;
+      background: rgba(255,255,255,0.8);
+      border-radius: 18px;
+      padding: 2.5em 1.2em 2em 1.2em;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      box-shadow: 0 8px 30px rgba(229,57,53,0.15), 0 4px 15px rgba(0,0,0,0.1);
+      justify-content: center;
+      backdrop-filter: blur(10px);
+      border: 1px solid rgba(255,255,255,0.3);
+    }
+    .ai-close-btn {
+      position:absolute; 
+      top:20px; 
+      right:20px; 
+      font-size:2em; 
+      background: rgba(229,57,53,0.1); 
+      border:none; 
+      color: var(--red); 
+      cursor:pointer; 
+      font-family:'Cabin',sans-serif;
+      width: 15px;
+      height: 45px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all .2s;
+    }
+    .ai-close-btn:hover {
+      background: var(--red);
+      color: #fff;
+      transform: scale(1.1);
+    }
+    .ai-subtitle {
+      font-size:1.35em;
+      color: rgba(229,57,53,0.8);
+      margin-bottom:1.6em;
+      font-family: 'Times New Roman', Times, serif;
+      text-align: center;
+      font-weight: bold;
+    }
+    .ai-predict-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 2.3em;
+      justify-content: center;
+      align-items: center;
+      width: 100%;
+      margin-bottom: 0.8em;
+    }
+    .ai-predict-card {
+      flex: 1 1 130px;
+      background: linear-gradient(135deg, #fff1f0 0%, #ffebee 100%);
+      border-radius: 16px;
+      padding: 1.8em 1.5em;
+      margin-bottom: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      box-shadow: 0 4px 15px rgba(229,57,53,0.15), 0 2px 8px rgba(0,0,0,0.1);
+      min-width: 150px;
+      max-width: 170px;
+      margin: 0 0.8em;
+      justify-content: center;
+      border: 1px solid rgba(229,57,53,0.1);
+      transition: transform .2s;
+    }
+    .ai-predict-card:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(229,57,53,0.2);
+    }
+    .ai-predict-value {
+      font-size:2.4em;
+      font-weight:700;
+      margin-bottom:0.4em;
+      color: var(--red);
+      text-align: center;
+    }
+    .ai-predict-label {
+      font-size:1.08em;
+      color: #b71c1c;
+      text-align:center;
+      font-family: 'Cabin',sans-serif;
+      font-weight: 600;
+    }
+    .ai-busno { color:#222; font-weight:700; margin-bottom:.5em;}
+    .ai-stop { color:var(--red); font-weight:700; }
+
+    /* BUS ROUTE DIAGRAM */
+    .bus-route-diagram-section {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      width: 100%;
+      margin-top: 2.5em;
+      margin-bottom: 1.2em;
+    }
+    .bus-route-diagram-title {
+      font-size: 1.15em;
+      font-weight: 700;
+      color: #e53935;
+      letter-spacing: 0.8px;
+      margin-bottom: 1em;
+    }
+    .bus-route-diagram {
+      display: flex;
+      align-items: center;
+      gap: 0.8em;
+      width: 92%;
+      max-width: 430px;
+      margin: 0 auto;
+    }
+    .route-stop {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-width: 80px;
+      max-width: 140px;
+      text-align: center;
+    }
+    .stop-marker {
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      border: 3px solid #e53935;
+      background: #fff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.3em;
+      font-weight: bold;
+      margin-bottom: 4px;
+      margin-top: 4px;
+      box-shadow: 0 2px 8px rgba(229,57,53,0.2);
+    }
+    .stop-marker.start { background: #e53935; color: #fff; }
+    .stop-marker.end { background: #43a047; color: #fff; }
+    .route-line {
+      flex: 1 1 50px;
+      height: 6px;
+      background: linear-gradient(to right, #e53935 30%, #43a047 100%);
+      border-radius: 3px;
+      margin: 0 4px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+    }
+    .stop-label {
+      font-size: 1.14em;
+      color: #222;
+      background: rgba(255,255,255,0.9);
+      border-radius: 8px;
+      padding: 4px 10px;
+      margin-top: 4px;
+      margin-bottom: 2px;
+      font-weight: 600;
+      letter-spacing: 0.3px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+    }
+
+    /* Alternate Ways Page */
+    .alt-ways-page {
+      min-height: 100vh;
+      background: var(--gradient);
+      font-family: 'Cabin',sans-serif;
+      color: #fff;
+      padding: 0;
+      margin: 0;
+      width: 100vw;
+      display: none;
+    }
+    .alt-ways-container {
+      max-width: 600px;
+      margin: 3em auto 0;
+      background: rgba(255,255,255,0.1);
+      border-radius: 20px;
+      padding: 2.5em 2.5em 2em 2.5em;
+      box-shadow: 0 0 30px rgba(0,0,0,0.2), 0 10px 40px rgba(229,57,53,0.2);
+      position: relative;
+      backdrop-filter: blur(10px);
+      border: 1px solid rgba(255,255,255,0.15);
+    }
+    .alt-h1 {
+      font-family: 'Italianno', cursive;
+      font-size: 2.9em;
+      text-align: center;
+      color: #fff;
+      margin-bottom: 0.3em;
+      text-shadow: 0 3px 14px rgba(229,57,53,0.4);
+      font-weight: normal;
+    }
+    .alt-subtitle {
+      text-align:center;
+      font-size:1.18em;
+      color: rgba(255,255,255,0.8);
+      margin-bottom:2.2em;
+      letter-spacing:2px;
+      font-family: 'Cabin', sans-serif;
+      font-weight: 600;
+    }
+    .back-btn {
+      position: absolute;
+      left: 20px;
+      top: 20px;
+      background: rgba(255,255,255,0.15);
+      color: #fff;
+      border: none;
+      border-radius: 10px;
+      font-size: 1.12em;
+      padding: 0.6em 1.4em;
+      cursor: pointer;
+      font-family: 'Cabin',sans-serif;
+      font-weight: bold;
+      box-shadow: 0 4px 15px rgba(229,57,53,0.2);
+      outline: none;
+      transition: all .25s;
+      backdrop-filter: blur(5px);
+    }
+    .back-btn:hover { 
+      background: var(--red); 
+      transform: translateY(-1px);
+      box-shadow: 0 6px 20px rgba(229,57,53,0.3);
+    }
+    .train-status-section {
+      margin-bottom: 3em;
+      background: rgba(255,255,255,0.08);
+      border-radius: 14px;
+      padding: 1.5em 1.2em 1.2em 1.2em;
+      box-shadow: 0 4px 15px rgba(229,57,53,0.2);
+      backdrop-filter: blur(5px);
+      border: 1px solid rgba(255,255,255,0.1);
+    }
+    .train-status-title {
+      font-size: 1.3em;
+      font-weight: bold;
+      color: var(--red);
+      margin-bottom: 1em;
+      text-shadow: 0 1px 3px rgba(0,0,0,0.2);
+    }
+    .train-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 1.08em;
+    }
+    .train-table th, .train-table td {
+      padding: 0.7em 0.6em;
+      text-align: left;
+    }
+    .train-table th {
+      color: #fff;
+      background: rgba(229,57,53,0.8);
+      border-radius: 6px;
+      font-weight: 600;
+      font-size: 1.1em;
+    }
+    .train-table td {
+      background: rgba(255,255,255,0.15);
+      color: #fff;
+      border-radius: 4px;
+      font-weight: 500;
+    }
+    .status-dot {
+      width: 12px; height: 12px; border-radius:50%; display:inline-block; margin-right:8px; vertical-align:middle;
+    }
+    .blue-dot { background: #1565c0; }
+    .green-dot { background: #43a047; }
+    .sub-dot { background: #e53935; }
+    .running { color: #4caf50; font-weight: 700;}
+    .delayed { color: #ff9800; font-weight: 700;}
+    .cancelled { color: #f44336; font-weight: 700;}
+    
+    /* Hide routing instructions */
+    .leaflet-routing-container {
+      display: none !important;
+    }
+    
+    @media (max-width:1400px) {
+      .container, #map, .bus-list { max-width: 98vw; }
+    }
+    @media (max-width:900px) {
+      .ai-prediction-slide, .ai-prediction-slide.show { width:99vw; right:-105vw; }
+      .ai-prediction-slide.show { right:0; }
+      .ai-tab { width: 98%; }
+      .button-row { flex-direction: column; gap: 0.8em; }
+      .button-row button, .button-row .alt-btn { width: 100%; max-width: 300px; }
+    }
+    @media (max-width:700px) {
+      .container, .alt-ways-container { padding: 1.5em 0.8em 1.2em 0.8em;}
+      #map { height:220px; }
+      .ai-prediction-slide, .ai-prediction-slide.show { width:99vw; right:-105vw; }
+      .ai-prediction-slide.show { right:0; }
+      .ai-tab { width: 98%; }
+      .bus-list { flex-direction: column; align-items: center;}
+      .input-row { flex-direction: column; gap: 1em; }
+      .location-bar { max-width: 100%; }
+    }
+
+    @keyframes pulse {
+      0% { transform: scale(1); }
+      50% { transform: scale(1.05); }
+      100% { transform: scale(1); }
+    }
+  </style>
+</head>
+<body>
+  <!-- Main Page -->
+  <div id="mainPage">
+    <div class="buzzcut-title" id="buzzcut-title"></div>
+    <div class="subtitle">Your Bus Guide</div>
+    <div class="container">      
+      <div id="messageArea"></div>
+      
+      <form id="routeForm">
+        <div class="input-row">
+          <div class="location-bar">
+            <span class="location-label">🚏 Pickup</span>
+            <select id="pickup" required>
+              <option value="">Select pickup location...</option>
+              <option value="Chennai Central">Chennai Central</option>
+              <option value="Egmore">Egmore</option>
+              <option value="Guindy">Guindy</option>
+              <option value="Koyambedu">Koyambedu</option>
+              <option value="T. Nagar">T. Nagar</option>
+              <option value="Velachery">Velachery</option>
+            </select>
+          </div>
+          <div class="location-bar">
+            <span class="location-label">🎯 Destination</span>
+            <select id="destination" required>
+              <option value="">Select destination...</option>
+              <option value="Chennai Central">Chennai Central</option>
+              <option value="Egmore">Egmore</option>
+              <option value="Guindy">Guindy</option>
+              <option value="Koyambedu">Koyambedu</option>
+              <option value="T. Nagar">T. Nagar</option>
+              <option value="Velachery">Velachery</option>
+            </select>
+          </div>
+        </div>
+        <div class="button-row">
+          <button type="submit" id="showBusesBtn">🚌 Find Buses</button>
+          <button type="button" class="alt-btn" onclick="showAlternateWays()">🚇 Alternate Routes</button>
+        </div>
+      </form>
+      <div id="map"></div>
+      <div class="bus-list" id="busList"></div>
+    </div>
+  </div>
+
+  <!-- AI Prediction Slide -->
+  <div class="ai-prediction-slide" id="aiPredictionSlide" style="display:none;">
+    <div class="ai-tab">
+      <div class="ai-title">🤖 AI Prediction</div>
+      <button class="ai-close-btn" onclick="hideAiSlide()" title="Close">&times;</button>
+      <div class="ai-subtitle"><span class="ai-busno" id="aiBusNo"></span>coming to <span class="ai-stop" id="aiStop"></span></div>
+      <div class="ai-predict-row">
+        <div class="ai-predict-card">
+          <div class="ai-predict-value" id="aiCrowd">Loading...</div>
+          <div class="ai-predict-label">Crowd Level</div>
+        </div>
+        <div class="ai-predict-card">
+          <div class="ai-predict-value" id="aiComfort">-</div>
+          <div class="ai-predict-label">Comfort Rating</div>
+        </div>
+        <div class="ai-predict-card">
+          <div class="ai-predict-value" id="aiETA">Loading...</div>
+          <div class="ai-predict-label">ETA to Pickup</div>
+        </div>
+      </div>
+      <div class="bus-route-diagram-section" id="busRouteDiagramSection" style="display:none;">
+        <div class="bus-route-diagram-title">🛣️ Bus Route</div>
+        <div class="bus-route-diagram" id="busRouteDiagram"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Alternate Ways Page -->
+  <div class="alt-ways-page" id="altWaysPage">
+    <div class="alt-ways-container">
+      <button class="back-btn" onclick="showMainPage()">← Back</button>
+      <div class="alt-h1">BuzzCut</div>
+      <div class="alt-subtitle">Alternate Routes - Metro & Suburban</div>
+      <div class="train-status-section">
+        <div class="train-status-title"><span class="status-dot blue-dot"></span>Chennai Metro Blue Line</div>
+        <table class="train-table">
+          <tr><th>Train</th><th>Status</th><th>Next Station</th><th>ETA (min)</th></tr>
+          <tbody id="blueMetroStatus"></tbody>
+        </table>
+      </div>
+      <div class="train-status-section">
+        <div class="train-status-title"><span class="status-dot green-dot"></span>Chennai Metro Green Line</div>
+        <table class="train-table">
+          <tr><th>Train</th><th>Status</th><th>Next Station</th><th>ETA (min)</th></tr>
+          <tbody id="greenMetroStatus"></tbody>
+        </table>
+      </div>
+      <div class="train-status-section">
+        <div class="train-status-title"><span class="status-dot sub-dot"></span>Suburban Trains</div>
+        <table class="train-table">
+          <tr><th>Train</th><th>Status</th><th>Next Station</th><th>ETA (min)</th></tr>
+          <tbody id="suburbanStatus"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet-routing-machine@3.2.12/dist/leaflet-routing-machine.js"></script>
+  <script>
+    // Configuration - Backend API URL
+    const API_BASE_URL = 'http://localhost:5000';
+    
+    // Backend connection status
+    let backendConnected = false;
+    
+    // Cache Management
+    const etaCache = new Map();
+    const crowdCache = new Map();
+    const routeCache = new Map();
+    const CACHE_DURATION = 3 * 60 * 1000; // 3 minutes
+
+    // Enhanced Chennai locations with coordinates
+    const locations = {
+      "Chennai Central": [13.0827, 80.2707],
+      "Egmore": [13.0820, 80.2616],
+      "Guindy": [13.0067, 80.2206],
+      "Koyambedu": [13.0732, 80.2057],
+      "T. Nagar": [13.0420, 80.2337],
+      "Velachery": [12.9756, 80.2214]
+    };
+
+    // Bus route definitions - maps route to available buses
+    const busRoutes = {
+      "Chennai Central-Egmore": [
+        {busNo: "12A", routeStart: "Chennai Central", routeEnd: "Egmore"},
+        {busNo: "15C", routeStart: "Chennai Central", routeEnd: "Egmore"},
+        {busNo: "9G", routeStart: "Chennai Central", routeEnd: "Egmore"}
+      ],
+      "Chennai Central-Guindy": [
+        {busNo: "18B", routeStart: "Chennai Central", routeEnd: "Guindy"},
+        {busNo: "41C", routeStart: "Chennai Central", routeEnd: "Guindy"},
+        {busNo: "42A", routeStart: "Chennai Central", routeEnd: "Guindy"}
+      ],
+      "Chennai Central-Koyambedu": [
+        {busNo: "27E", routeStart: "Chennai Central", routeEnd: "Koyambedu"},
+        {busNo: "5B", routeStart: "Chennai Central", routeEnd: "Koyambedu"}
+      ],
+      "Chennai Central-T. Nagar": [
+        {busNo: "23A", routeStart: "Chennai Central", routeEnd: "T. Nagar"},
+        {busNo: "15D", routeStart: "Chennai Central", routeEnd: "T. Nagar"},
+        {busNo: "19K", routeStart: "Chennai Central", routeEnd: "T. Nagar"}
+      ],
+      "Chennai Central-Velachery": [
+        {busNo: "45G", routeStart: "Chennai Central", routeEnd: "Velachery"},
+        {busNo: "47B", routeStart: "Chennai Central", routeEnd: "Velachery"}
+      ],
+      "Egmore-Guindy": [
+        {busNo: "21A", routeStart: "Egmore", routeEnd: "Guindy"},
+        {busNo: "29C", routeStart: "Egmore", routeEnd: "Guindy"}
+      ],
+      "Egmore-Koyambedu": [
+        {busNo: "28B", routeStart: "Egmore", routeEnd: "Koyambedu"},
+        {busNo: "11G", routeStart: "Egmore", routeEnd: "Koyambedu"}
+      ],
+      "Egmore-T. Nagar": [
+        {busNo: "8A", routeStart: "Egmore", routeEnd: "T. Nagar"},
+        {busNo: "16B", routeStart: "Egmore", routeEnd: "T. Nagar"}
+      ],
+      "Egmore-Velachery": [
+        {busNo: "52A", routeStart: "Egmore", routeEnd: "Velachery"},
+        {busNo: "21D", routeStart: "Egmore", routeEnd: "Velachery"}
+      ],
+      "Guindy-Koyambedu": [
+        {busNo: "40B", routeStart: "Guindy", routeEnd: "Koyambedu"},
+        {busNo: "6C", routeStart: "Guindy", routeEnd: "Koyambedu"}
+      ],
+      "Guindy-T. Nagar": [
+        {busNo: "3A", routeStart: "Guindy", routeEnd: "T. Nagar"},
+        {busNo: "4B", routeStart: "Guindy", routeEnd: "T. Nagar"},
+        {busNo: "31D", routeStart: "Guindy", routeEnd: "T. Nagar"}
+      ],
+      "Guindy-Velachery": [
+        {busNo: "22A", routeStart: "Guindy", routeEnd: "Velachery"},
+        {busNo: "54B", routeStart: "Guindy", routeEnd: "Velachery"}
+      ],
+      "Koyambedu-T. Nagar": [
+        {busNo: "7A", routeStart: "Koyambedu", routeEnd: "T. Nagar"},
+        {busNo: "20B", routeStart: "Koyambedu", routeEnd: "T. Nagar"}
+      ],
+      "Koyambedu-Velachery": [
+        {busNo: "50A", routeStart: "Koyambedu", routeEnd: "Velachery"},
+        {busNo: "26C", routeStart: "Koyambedu", routeEnd: "Velachery"}
+      ],
+      "T. Nagar-Velachery": [
+        {busNo: "1A", routeStart: "T. Nagar", routeEnd: "Velachery"},
+        {busNo: "48B", routeStart: "T. Nagar", routeEnd: "Velachery"},
+        {busNo: "25C", routeStart: "T. Nagar", routeEnd: "Velachery"}
+      ]
+    };
+
+    // Generate reverse routes
+    function initializeBusRoutes() {
+      const originalRoutes = {...busRoutes};
+      for (const [routeKey, buses] of Object.entries(originalRoutes)) {
+        const [origin, dest] = routeKey.split('-');
+        const reverseKey = `${dest}-${origin}`;
+        if (!busRoutes[reverseKey]) {
+          busRoutes[reverseKey] = buses.map(bus => ({
+            ...bus,
+            routeStart: dest,
+            routeEnd: origin
+          }));
+        }
+      }
+    }
+    initializeBusRoutes();
+
+    // Current state
+    let map, routingControl, pickupMarker, destMarker, busMarkers = [];
+    let currentBuses = [];
+    let lastPickup = "", lastDest = "";
+
+    // Utility Functions
+    function showMessage(message, type = 'error') {
+      const messageArea = document.getElementById('messageArea');
+      messageArea.innerHTML = `<div class="${type}-message">${message}</div>`;
+      setTimeout(() => messageArea.innerHTML = '', 5000);
+    }
+
+    function setLoading(elementId, isLoading) {
+      const element = document.getElementById(elementId);
+      if (isLoading) {
+        element.innerHTML = '<span class="loading"></span>Loading...';
+        element.disabled = true;
+      } else {
+        element.innerHTML = '🚌 Find Buses';
+        element.disabled = false;
+      }
+    }
+
+    function calculateDistance(lat1, lon1, lat2, lon2) {
+      const R = 6371; // Earth's radius in km
+      const dLat = (lat2 - lat1) * Math.PI / 180;
+      const dLon = (lon2 - lon1) * Math.PI / 180;
+      const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                Math.sin(dLon/2) * Math.sin(dLon/2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      return R * c;
+    }
+
+    function getCachedETA(busId) {
+      const cached = etaCache.get(busId);
+      if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+        return cached.eta;
+      }
+      return null;
+    }
+    
+    function setCachedETA(busId, eta) {
+      etaCache.set(busId, {
+        eta: eta,
+        timestamp: Date.now()
+      });
+    }
+
+    function getCachedCrowd(busId) {
+      const cached = crowdCache.get(busId);
+      if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+        return cached.crowd;
+      }
+      return null;
+    }
+    
+    function setCachedCrowd(busId, crowd) {
+      crowdCache.set(busId, {
+        crowd: crowd,
+        timestamp: Date.now()
+      });
+    }
+
+    // Backend Connection Check
+    async function checkBackendConnection() {
+      try {
+        const response = await fetch(`${API_BASE_URL}/start`, {
+          method: 'GET',
+          headers: { 'Content-Type': 'application/json' }
+        });
+        backendConnected = true;
+        return true;
+      } catch (error) {
+        console.error('Backend connection failed:', error);
+        backendConnected = false;
+        return false;
+      }
+    }
+
+    // Create Bus Data Structure for API
+    function createBusDataStructure(pickup, destination, busInfo) {
+      const pickupCoords = locations[pickup];
+      const destCoords = locations[destination];
+      const distance = calculateDistance(pickupCoords[0], pickupCoords[1], destCoords[0], destCoords[1]);
+      
+      const now = new Date();
+      const hour = now.getHours();
+      const dayOfWeek = now.getDay();
+      const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
+      const isPeakHour = (hour >= 8 && hour <= 10) || (hour >= 17 && hour <= 20);
+      
+      // Generate realistic bus data
+      const basePassengers = isPeakHour ? 45 : 25;
+      const variance = Math.random() * 20 - 10;
+      const currentPassengers = Math.max(5, Math.min(60, basePassengers + variance));
+      
+      return {
+        busNo: busInfo.busNo,
+        pickup,
+        destination,
+        origin: pickup,
+        pickupCoords,
+        destCoords,
+        distance_km: distance,
+        hour,
+        day_of_week: dayOfWeek,
+        is_weekend: isWeekend,
+        is_peak_hour: isPeakHour,
+        current_passengers: currentPassengers,
+        bus_capacity: 60,
+        stops_remaining: Math.ceil(distance * 2),
+        avg_stop_time: 1.5,
+        traffic_multiplier: isPeakHour ? 1.4 : 1.0,
+        weather_delay_factor: 1.0,
+        buses_per_hour_at_stop: 8,
+        route_type: "city",
+        weather: "clear",
+        timestamp: Date.now(),
+        routeStart: busInfo.routeStart,
+        routeEnd: busInfo.routeEnd
+      };
+    }
+
+    // Generate Bus Positions
+    function generateBusPosition(pickup, destination) {
+      const pickupCoords = locations[pickup];
+      const destCoords = locations[destination];
+      
+      // Generate position somewhere along the route (20-80% of the way)
+      const progress = 0.2 + Math.random() * 0.6;
+      const lat = pickupCoords[0] + (destCoords[0] - pickupCoords[0]) * progress;
+      const lng = pickupCoords[1] + (destCoords[1] - pickupCoords[1]) * progress;
+      
+      // Add some random offset to make it more realistic
+      const latOffset = (Math.random() - 0.5) * 0.01;
+      const lngOffset = (Math.random() - 0.5) * 0.01;
+      
+      return [lat + latOffset, lng + lngOffset];
+    }
+
+    // API Calls
+    async function predictETA(busData) {
+      const cachedETA = getCachedETA(busData.busNo);
+      if (cachedETA !== null) return cachedETA;
+      
+      if (!backendConnected) {
+        throw new Error('Backend not available');
+      }
+      
+      try {
+        const response = await fetch(`${API_BASE_URL}/predict`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(busData),
+          signal: AbortSignal.timeout(10000)
+        });
+        
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        
+        const data = await response.json();
+        const eta = data.eta_minutes;
+        setCachedETA(busData.busNo, eta);
+        return eta;
+      } catch (error) {
+        console.error('ETA prediction failed:', error);
+        throw error;
+      }
+    }
+
+    async function predictCrowd(busData) {
+      const cachedCrowd = getCachedCrowd(busData.busNo);
+      if (cachedCrowd !== null) return cachedCrowd;
+      
+      if (!backendConnected) {
+        throw new Error('Backend not available');
+      }
+      
+      try {
+        const response = await fetch(`${API_BASE_URL}/predict_crowd`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(busData),
+          signal: AbortSignal.timeout(10000)
+        });
+        
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        
+        const data = await response.json();
+        const crowd = data.crowd_percentage;
+        setCachedCrowd(busData.busNo, crowd);
+        return crowd;
+      } catch (error) {
+        console.error('Crowd prediction failed:', error);
+        throw error;
+      }
+    }
+
+    // Enhanced SWAY MOTION for BuzzCut
+    const swayBuzzcut = () => {
+      const el = document.getElementById('buzzcut-title');
+      if (!el) return;
+      const text = 'BuzzCut';
+      if(!el.dataset.swayed){
+        el.innerHTML = '';
+        for (let i = 0; i < text.length; ++i) {
+          const span = document.createElement('span');
+          span.className = 'buzzcut-letter';
+          span.textContent = text[i];
+          el.appendChild(span);
+        }
+        el.dataset.swayed = "1";
+      }
+      const letters = el.querySelectorAll('.buzzcut-letter');
+      let sway = () => {
+        const now = Date.now();
+        for (let i = 0; i < letters.length; ++i) {
+          const angle = Math.sin(now/700 + i*0.6) * 0.2;
+          const x = Math.sin(now/1000 + i*0.9) * 0.15;
+          const y = Math.sin(now/600 + i*0.8) * 0.12;
+          const scale = 1 + Math.sin(now/1200 + i*0.4) * 0.02;
+          letters[i].style.transform = `rotate(${angle}deg) translate(${x}px, ${y}px) scale(${scale})`;
+        }
+        requestAnimationFrame(sway);
+      };
+      sway();
+    };
+    window.addEventListener('DOMContentLoaded', swayBuzzcut);
+
+    // Initialize map
+    map = L.map('map', {zoomControl: true}).setView([13.0827, 80.2707], 12);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '© OpenStreetMap contributors'
+    }).addTo(map);
+
+    // Route Form Submit Handler
+    document.getElementById('routeForm').onsubmit = async function(e) {
+      e.preventDefault();
+      const pickup = document.getElementById('pickup').value;
+      const dest = document.getElementById('destination').value;
+      
+      if (!pickup || !dest || pickup === dest) {
+        showMessage('Please select different pickup and destination locations.');
+        return;
+      }
+      
+      setLoading('showBusesBtn', true);
+      
+      try {
+        lastPickup = pickup;
+        lastDest = dest;
+        
+        // Check backend connection
+        showMessage('🔄 Connecting to backend...', 'success');
+        const isConnected = await checkBackendConnection();
+        
+        if (isConnected) {
+          showMessage('✅ Backend connected! Generating bus data...', 'success');
+        } else {
+          showMessage('⚠️ Backend offline - using demo data', 'warning');
+        }
+        
+        // Get available buses for this route
+        const routeKey = `${pickup}-${dest}`;
+        const availableBuses = busRoutes[routeKey] || [];
+        
+        if (availableBuses.length === 0) {
+          showMessage('❌ No buses available for this route.', 'error');
+          return;
+        }
+        
+        // Generate bus data and get predictions
+        const busesWithData = [];
+        for (const busInfo of availableBuses) {
+          const busData = createBusDataStructure(pickup, dest, busInfo);
+          const [lat, lng] = generateBusPosition(pickup, dest);
+          
+          let eta, crowdPercentage;
+          
+          if (isConnected) {
+            try {
+              eta = await predictETA(busData);
+              crowdPercentage = await predictCrowd(busData);
+            } catch (error) {
+              // Fallback to calculated values if API fails
+              eta = Math.round(busData.distance_km * 3 + Math.random() * 5);
+              crowdPercentage = (busData.current_passengers / busData.bus_capacity) * 100;
+            }
+          } else {
+            // Offline mode - use calculated values
+            eta = Math.round(busData.distance_km * 3 + Math.random() * 5);
+            crowdPercentage = (busData.current_passengers / busData.bus_capacity) * 100;
+          }
+          
+          let crowd = 'medium';
+          if (crowdPercentage < 35) crowd = 'free';
+          else if (crowdPercentage > 60) crowd = 'full';
+          
+          busesWithData.push({
+            ...busData,
+            lat,
+            lng,
+            eta,
+            crowdPercentage,
+            crowd,
+            comfort: crowdPercentage < 30 ? '8.5' : crowdPercentage < 70 ? '6.8' : '4.2'
+          });
+        }
+        
+        await displayRoute(pickup, dest, busesWithData);
+        showMessage('✅ Bus data loaded successfully!', 'success');
+        
+      } catch (error) {
+        console.error('Error in route form:', error);
+        showMessage('❌ An unexpected error occurred. Please try again.');
+      } finally {
+        setLoading('showBusesBtn', false);
+        hideAiSlide();
+      }
+    };
+
+    async function displayRoute(pickup, dest, buses) {
+      // Clear existing route
+      if (routingControl) map.removeControl(routingControl);
+      if (pickupMarker) map.removeLayer(pickupMarker);
+      if (destMarker) map.removeLayer(destMarker);
+      
+      // Create road-based routing
+      routingControl = L.Routing.control({
+        waypoints: [
+          L.latLng(locations[pickup][0], locations[pickup][1]),
+          L.latLng(locations[dest][0], locations[dest][1])
+        ],
+        routeWhileDragging: false,
+        addWaypoints: false,
+        createMarker: function() { return null; },
+        lineOptions: {
+          styles: [
+            {color: '#e53935', weight: 6, opacity: 0.8},
+            {color: '#ffffff', weight: 2, opacity: 1}
+          ]
+        }
+      }).addTo(map);
+      
+      // Add custom markers
+      pickupMarker = L.marker(locations[pickup], {
+        icon: L.divIcon({
+          className: 'custom-marker',
+          html: '<div style="background: #4caf50; color: white; border-radius: 50%; width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; font-weight: bold; border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);">📍</div>',
+          iconSize: [30, 30],
+          iconAnchor: [15, 15]
+        })
+      }).addTo(map).bindPopup(`<b>🚏 Pickup</b><br>${pickup}`).openPopup();
+      
+      destMarker = L.marker(locations[dest], {
+        icon: L.divIcon({
+          className: 'custom-marker',
+          html: '<div style="background: #e53935; color: white; border-radius: 50%; width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; font-weight: bold; border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);">🎯</div>',
+          iconSize: [30, 30],
+          iconAnchor: [15, 15]
+        })
+      }).addTo(map).bindPopup(`<b>🎯 Destination</b><br>${dest}`);
+      
+      // Fit map to show route
+      setTimeout(() => {
+        map.fitBounds([locations[pickup], locations[dest]], { padding: [50, 50] });
+      }, 500);
+      
+      // Set current buses
+      currentBuses = buses;
+      
+      // Place buses on map
+      busMarkers.forEach(m => map.removeLayer(m));
+      busMarkers = currentBuses.map((bus, idx) => {
+        const eta = bus.eta || 'N/A';
+        return L.marker([bus.lat, bus.lng], {
+          icon: L.divIcon({
+            className:'bus-marker',
+            html:`<div style="background: linear-gradient(135deg, #e53935, #d32f2f); border-radius: 50%; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; font-size: 18px; border: 3px solid white; box-shadow: 0 3px 10px rgba(229,57,53,0.4); animation: pulse 2s infinite;">🚌</div>`,
+            iconSize:[32,32],iconAnchor:[16,16]
+          })
+        }).addTo(map).on('click', function(){
+          selectBus(idx);
+        }).bindPopup(
+          `<div style="text-align: center; padding: 5px;">
+            <b style="color: #e53935; font-size: 1.1em;">🚌 ${bus.busNo}</b><br>
+            <div style="margin: 8px 0;">
+              <span style="background: #4caf50; color: white; padding: 3px 8px; border-radius: 12px; font-size: 0.9em;">⏱️ ${eta} min</span>
+            </div>
+            <div style="margin: 5px 0;">
+              <span class="crowd ${bus.crowd}" style="padding: 3px 8px; border-radius: 8px; font-size: 0.9em;">👥 ${bus.crowd}</span>
+            </div>
+          </div>`
+        );
+      });
+      
+      renderBusList();
+    }
+
+    function renderBusList(selectedIdx) {
+      if (!currentBuses || currentBuses.length === 0) {
+        document.getElementById('busList').innerHTML = '<div style="text-align: center; color: rgba(255,255,255,0.8); padding: 2em;">No bus data available</div>';
+        return;
+      }
+      
+      document.getElementById('busList').innerHTML = currentBuses.map((bus, idx) => {
+        const eta = bus.eta || 'N/A';
+        return `<div class="bus-card${selectedIdx===idx?' selected':''}" onclick="selectBus(${idx})">
+          <div class="bus-info">
+            <div style="font-size: 1.2em; margin-bottom: 3px;"><b>🚌 ${bus.busNo}</b></div>
+            <div style="font-size: 1em; color: rgba(255,255,255,0.9);">ETA: <b>${eta} minutes</b></div>
+          </div>
+          <span class="crowd ${bus.crowd}">${bus.crowd}</span>
+        </div>`;
+      }).join('');
+    }
+
+    // Expose selectBus to global
+    window.selectBus = function(idx) {
+      if (!currentBuses || !currentBuses[idx]) return;
+      
+      renderBusList(idx);
+      showAiPrediction(idx);
+      if (busMarkers[idx]) {
+        busMarkers[idx].openPopup();
+        map.setView([currentBuses[idx].lat, currentBuses[idx].lng], 14);
+      }
+    }
+
+    async function showAiPrediction(idx) {
+      const bus = currentBuses[idx];
+      if (!bus) return;
+      
+      document.getElementById('aiBusNo').textContent = "Bus " + bus.busNo + " ";
+      document.getElementById('aiStop').textContent = lastPickup;
+      
+      // Show loading state
+      document.getElementById('aiCrowd').textContent = '...';
+      document.getElementById('aiETA').textContent = '...';
+      document.getElementById('aiComfort').textContent = '...';
+      
+      document.getElementById('aiPredictionSlide').style.display = "";
+      setTimeout(() => document.getElementById('aiPredictionSlide').classList.add('show'), 50);
+
+      // Display predictions
+      document.getElementById('aiETA').textContent = Math.round(bus.eta) + " min";
+      document.getElementById('aiCrowd').textContent = Math.round(bus.crowdPercentage) + "%";
+      document.getElementById('aiComfort').textContent = bus.comfort + "/10";
+
+      showBusRouteDiagram(bus.routeStart, bus.routeEnd);
+    }
+
+    function showBusRouteDiagram(routeStart, routeEnd) {
+      const section = document.getElementById('busRouteDiagramSection');
+      const diagram = document.getElementById('busRouteDiagram');
+      if (!routeStart || !routeEnd) {
+        section.style.display = "none";
+        return;
+      }
+      section.style.display = "";
+      diagram.innerHTML = `
+        <div class="route-stop">
+          <div class="stop-marker start" title="Route Start">S</div>
+          <span class="stop-label">${routeStart}</span>
+        </div>
+        <div class="route-line"></div>
+        <div class="route-stop">
+          <div class="stop-marker end" title="Route End">E</div>
+          <span class="stop-label">${routeEnd}</span>
+        </div>
+      `;
+    }
+
+    function hideAiSlide() {
+      document.getElementById('aiPredictionSlide').classList.remove('show');
+      setTimeout(() => {
+        document.getElementById('aiPredictionSlide').style.display="none";
+      }, 500);
+    }
+    window.hideAiSlide = hideAiSlide;
+
+    // Alternate Ways Page Logic
+    function showAlternateWays() {
+      document.getElementById('mainPage').style.display = 'none';
+      document.getElementById('altWaysPage').style.display = 'block';
+      populateAltTrains();
+    }
+    
+    function showMainPage() {
+      document.getElementById('altWaysPage').style.display = 'none';
+      document.getElementById('mainPage').style.display = '';
+    }
+    
+    window.showAlternateWays = showAlternateWays;
+    window.showMainPage = showMainPage;
+    
+    function populateAltTrains() {
+      let blueHtml = '';
+      for(let i=1; i<=3; i++) {
+        let status = (Math.random()<0.8) ? "running" : (Math.random()<0.5?"delayed":"cancelled");
+        let next = ["Washermenpet","Airport","Guindy","Central","Ashok Nagar","LIC","Vadapalani"][Math.floor(Math.random()*7)];
+        let eta = (status=="cancelled") ? '-' : (4+Math.floor(Math.random()*10));
+        blueHtml += `<tr>
+          <td><b>Blue-${i}</b></td>
+          <td class="${status}">${status.charAt(0).toUpperCase()+status.slice(1)}</td>
+          <td>${next}</td>
+          <td><b>${eta}</b></td>
+        </tr>`;
+      }
+      document.getElementById('blueMetroStatus').innerHTML = blueHtml;
+      
+      let greenHtml = '';
+      for(let i=1; i<=3; i++) {
+        let status = (Math.random()<0.85) ? "running" : (Math.random()<0.5?"delayed":"cancelled");
+        let next = ["Central","St. Thomas Mount","AG-DMS","Kilpauk","Arumbakkam","CMBT"][Math.floor(Math.random()*6)];
+        let eta = (status=="cancelled") ? '-' : (3+Math.floor(Math.random()*8));
+        greenHtml += `<tr>
+          <td><b>Green-${i}</b></td>
+          <td class="${status}">${status.charAt(0).toUpperCase()+status.slice(1)}</td>
+          <td>${next}</td>
+          <td><b>${eta}</b></td>
+        </tr>`;
+      }
+      document.getElementById('greenMetroStatus').innerHTML = greenHtml;
+      
+      let subHtml = '';
+      for(let i=1; i<=4; i++) {
+        let status = (Math.random()<0.85) ? "running" : (Math.random()<0.5?"delayed":"cancelled");
+        let next = ["Park","Guindy","Tambaram","Beach","Avadi","Egmore","Mambalam"][Math.floor(Math.random()*7)];
+        let eta = (status=="cancelled") ? '-' : (6+Math.floor(Math.random()*17));
+        subHtml += `<tr>
+          <td><b>Suburban-${i}</b></td>
+          <td class="${status}">${status.charAt(0).toUpperCase()+status.slice(1)}</td>
+          <td>${next}</td>
+          <td><b>${eta}</b></td>
+        </tr>`;
+      }
+      document.getElementById('suburbanStatus').innerHTML = subHtml;
+    }
+
+    // Initialize page
+    document.addEventListener('DOMContentLoaded', () => {
+      document.getElementById('altWaysPage').style.display = 'none';
+      document.getElementById('mainPage').style.display = '';
+      
+      // Check backend connection on load
+      checkBackendConnection().then(connected => {
+        if (!connected) {
+          showMessage('⚠️ Backend service is currently unavailable. Demo mode active.', 'warning');
+        } else {
+          showMessage('✅ Backend service connected successfully!', 'success');
+        }
+      });
+    });
+  </script>
+</body>
+</html>
+
+## Label_encoders.pkl
+
+€•"      }”(Œ
+route_type”Œsklearn.preprocessing._label”ŒLabelEncoder”“”)”}”(Œclasses_”Œjoblib.numpy_pickle”ŒNumpyArrayWrapper”“”)”}”(Œsubclass”Œnumpy”Œ ndarray”“”Œshape”K…”Œorder”ŒC”Œdtype”hŒdtype”“”ŒO8”‰ˆ‡”R”(KŒ|”NNNJÿÿÿÿJÿÿÿÿK?t”bŒ
+allow_mmap”‰Œnumpy_array_alignment_bytes”Kub€•Õ       Œnumpy._core.multiarray”Œ_reconstruct”“”Œnumpy”Œ ndarray”“”K …”Cb”‡”R”(KK…”hŒdtype”“”ŒO8”‰ˆ‡”R”(KŒ|”NNNJÿÿÿÿJÿÿÿÿK?t”b‰]”(Œ
+Airport_Route”Œ
+Beach_Route”Œ
+City_Circle”Œ
+IT_Corridor”ŒSuburban_Route”et”b.•S       Œ_sklearn_version”Œ1.6.1”ubŒorigin”h)”}”(h h
+)”}”(h
+hhK'…”hhhhh‰hKub€•k      Œnumpy._core.multiarray”Œ_reconstruct”“”Œnumpy”Œ ndarray”“”K …”Cb”‡”R”(KK'…”hŒdtype”“”ŒO8”‰ˆ‡”R”(KŒ|”NNNJÿÿÿÿJÿÿÿÿK?t”b‰]”(ŒAdyar Bus Stand”Œ Alandur”ŒAlwarpet”Œ
+Anna Nagar”ŒAnna Nagar East”Œ
+Arumbakkam”Œ
+Ashok Nagar”ŒAvadi”ŒBroadway”ŒCMBT”ŒCentral Station”ŒChrompet”ŒEgmore”ŒEnnore”ŒFort St. George”ŒGuindy”Œ
+High Court”ŒKK Nagar”Œ Kilpauk”Œ
+Kodambakkam”Œ	Koyambedu”Œ Mangadu”ŒMylapore”ŒNungambakkam”Œ
+Pallavaram”ŒPerambur”Œ
+Poonamallee”ŒPorur”Œ	Red Hills”Œ	Royapuram”ŒSaidapet”Œ T.Nagar”ŒTambaram”ŒThirumayilai”Œ
+Thiruvottiyur”Œ
+Tondiarpet”Œ
+Vadapalani”Œ
+Villivakkam”ŒWashermanpet”et”b.•A       hh ubŒ
+destination”h)”}”(h h
+)”}”(h
+hhK'…”hhhhh‰hKub€•k      Œnumpy._core.multiarray”Œ_reconstruct”“”Œnumpy”Œ ndarray”“”K …”Cb”‡”R”(KK'…”hŒdtype”“”ŒO8”‰ˆ‡”R”(KŒ|”NNNJÿÿÿÿJÿÿÿÿK?t”b‰]”(ŒAdyar Bus Stand”Œ Alandur”ŒAlwarpet”Œ
+Anna Nagar”ŒAnna Nagar East”Œ
+Arumbakkam”Œ
+Ashok Nagar”ŒAvadi”ŒBroadway”ŒCMBT”ŒCentral Station”ŒChrompet”ŒEgmore”ŒEnnore”ŒFort St. George”ŒGuindy”Œ
+High Court”ŒKK Nagar”Œ Kilpauk”Œ
+Kodambakkam”Œ	Koyambedu”Œ Mangadu”ŒMylapore”ŒNungambakkam”Œ
+Pallavaram”ŒPerambur”Œ
+Poonamallee”ŒPorur”Œ	Red Hills”Œ	Royapuram”ŒSaidapet”Œ T.Nagar”ŒTambaram”ŒThirumayilai”Œ
+Thiruvottiyur”Œ
+Tondiarpet”Œ
+Vadapalani”Œ
+Villivakkam”ŒWashermanpet”et”b.•=       hh ubŒ weather”h)”}”(h h
+)”}”(h
+hhK…”hhhhh‰hKub€•«       Œnumpy._core.multiarray”Œ_reconstruct”“”Œnumpy”Œ ndarray”“”K …”Cb”‡”R”(KK…”hŒdtype”“”ŒO8”‰ˆ‡”R”(KŒ|”NNNJÿÿÿÿJÿÿÿÿK?t”b‰]”(Œcloudy”Œfoggy”Œrainy”Œsunny”et”b.•       hh ubu.
+
+
+
+
+    app.run(host="0.0.0.0", port=5000, debug=True)
